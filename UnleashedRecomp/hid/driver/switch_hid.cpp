@@ -177,7 +177,6 @@ void hid::Init()
     padInitializeDefault(&g_pad);
     hidPermitVibration(true);
     SelectControllerDevice();
-    LOGN("Switch HID initialized");
 }
 
 uint32_t hid::GetState(uint32_t dwUserIndex, XAMINPUT_STATE* pState)

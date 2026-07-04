@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "memory.h"
 #include "function.h"
+#include <os/logger.h>
 
 constexpr size_t USER_HEAP_BEGIN = 0x20000;
 constexpr size_t RESERVED_BEGIN = 0x7FEA0000;
@@ -46,6 +47,30 @@ bool EnsureCommittedPrefix(size_t rangeStart, size_t rangeSize, size_t& committe
     committedPrefix = requestedPrefix;
     return true;
 }
+
+// Commit ahead of an o1heap allocation. o1heap places fragments at or below
+// the fragment high-water mark ("frontier": freed fragments sit below it;
+// the virgin root starts below it and extends past), so frontier + this
+// fragment always covers both the allocation and the split-remainder header
+// o1heap writes during it. The frontier is advanced from the actual returned
+// pointers, so commit demand tracks the PEAK footprint: the previous
+// accounting summed every allocation into a counter frees never shrank,
+// inflating the commit toward the whole arena until the console's physical
+// limit made allocations fail while the heap had plenty of room.
+bool PreCommitForAllocation(size_t rangeStart, size_t rangeSize, size_t& committedPrefix, size_t frontier, size_t fragmentSize)
+{
+    const size_t needed = std::min(rangeSize, frontier + fragmentSize + O1HEAP_ALIGNMENT);
+    if (needed <= committedPrefix)
+        return true;
+
+    return EnsureCommittedPrefix(rangeStart, rangeSize, committedPrefix, needed);
+}
+
+size_t FragmentEndOffset(const void* arenaStart, const void* ptr, size_t fragmentSize)
+{
+    const size_t offset = static_cast<size_t>(static_cast<const uint8_t*>(ptr) - static_cast<const uint8_t*>(arenaStart));
+    return offset - O1HEAP_ALIGNMENT + fragmentSize;
+}
 }
 #endif
 
@@ -79,22 +104,21 @@ void* Heap::Alloc(size_t size)
         return nullptr;
 
 #if defined(__SWITCH__)
-    const size_t touchedEnd = touchedHeapPrefix + RoundHeapFragmentSize(size);
-    if (!EnsureCommittedPrefix(USER_HEAP_BEGIN, USER_HEAP_SIZE, committedHeapPrefix, touchedEnd))
+    const size_t fragmentSize = RoundHeapFragmentSize(size);
+    if (!PreCommitForAllocation(USER_HEAP_BEGIN, USER_HEAP_SIZE, committedHeapPrefix, touchedHeapPrefix, fragmentSize))
     {
+        LOGFN_ERROR("Switch user heap commit failed: size={}, fragment={}, frontier={}, committed={}", size, fragmentSize, touchedHeapPrefix, committedHeapPrefix);
         return nullptr;
     }
-    touchedHeapPrefix = std::min(USER_HEAP_SIZE, touchedEnd);
 #endif
 
     void* ptr = o1heapAllocate(heap, size);
 
 #if defined(__SWITCH__)
-    if (ptr != nullptr && !g_memory.CommitHostRange(static_cast<uint8_t*>(ptr) - O1HEAP_ALIGNMENT, size + O1HEAP_ALIGNMENT))
-    {
-        o1heapFree(heap, ptr);
-        return nullptr;
-    }
+    if (ptr == nullptr)
+        LOGFN_ERROR("Switch user heap allocation failed: size={}, frontier={}, committed={}", size, touchedHeapPrefix, committedHeapPrefix);
+    else
+        touchedHeapPrefix = std::max(touchedHeapPrefix, FragmentEndOffset(g_memory.Translate(USER_HEAP_BEGIN), ptr, fragmentSize));
 #endif
 
     return ptr;
@@ -111,24 +135,25 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
         return nullptr;
 
 #if defined(__SWITCH__)
-    const size_t touchedEnd = touchedPhysicalHeapPrefix + RoundHeapFragmentSize(allocationSize);
-    if (!EnsureCommittedPrefix(RESERVED_END, PHYSICAL_HEAP_SIZE, committedPhysicalHeapPrefix, touchedEnd))
+    const size_t fragmentSize = RoundHeapFragmentSize(allocationSize);
+    if (!PreCommitForAllocation(RESERVED_END, PHYSICAL_HEAP_SIZE, committedPhysicalHeapPrefix, touchedPhysicalHeapPrefix, fragmentSize))
     {
+        LOGFN_ERROR("Switch physical heap commit failed: size={}, fragment={}, frontier={}, committed={}", size, fragmentSize, touchedPhysicalHeapPrefix, committedPhysicalHeapPrefix);
         return nullptr;
     }
-    touchedPhysicalHeapPrefix = std::min(PHYSICAL_HEAP_SIZE, touchedEnd);
 #endif
 
     void* ptr = o1heapAllocate(physicalHeap, allocationSize);
     if (ptr == nullptr)
-        return nullptr;
-
-#if defined(__SWITCH__)
-    if (!g_memory.CommitHostRange(ptr, allocationSize))
     {
-        o1heapFree(physicalHeap, ptr);
+#if defined(__SWITCH__)
+        LOGFN_ERROR("Switch physical heap allocation failed: size={}, frontier={}, committed={}", size, touchedPhysicalHeapPrefix, committedPhysicalHeapPrefix);
+#endif
         return nullptr;
     }
+
+#if defined(__SWITCH__)
+    touchedPhysicalHeapPrefix = std::max(touchedPhysicalHeapPrefix, FragmentEndOffset(g_memory.Translate(RESERVED_END), ptr, fragmentSize));
 #endif
 
     size_t aligned = ((size_t)ptr + alignment) & ~(alignment - 1);

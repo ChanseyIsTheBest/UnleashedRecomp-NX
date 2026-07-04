@@ -1,3 +1,35 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..ef42623 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -849,7 +849,8 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_EIEIO:
+-        // no op
++        // Store-ordering barrier (guest uses it to publish data before a flag).
++        println("\tPPC_LWSYNC();");
+         break;
+ 
+     case PPC_INST_EXTSB:
+@@ -1209,7 +1210,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWSYNC:
+-        // no op
++        println("\tPPC_LWSYNC();");
+         break;
+ 
+     case PPC_INST_LWZ:
+@@ -1711,7 +1712,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_SYNC:
+-        // no op
++        println("\tPPC_SYNC();");
+         break;
+ 
+     case PPC_INST_TDLGEI:
 diff --git a/XenonUtils/file.h b/XenonUtils/file.h
 index 8d0f2ae..eb2cc22 100644
 --- a/XenonUtils/file.h
@@ -203,13 +235,32 @@ index a3de88b..f1b42c4 100644
      int fileHandle = -1;
      void *fileView = MAP_FAILED;
 diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
-index 31a86cd..f067d14 100644
+index 31a86cd..bb9f1cc 100644
 --- a/XenonUtils/ppc_context.h
 +++ b/XenonUtils/ppc_context.h
-@@ -16,6 +16,26 @@
+@@ -5,6 +5,7 @@
+ #error "ppc_config.h must be included before ppc_context.h"
+ #endif
+ 
++#include <atomic>
+ #include <climits>
+ #include <cmath>
+ #include <csetjmp>
+@@ -16,6 +17,37 @@
  #include <x86/sse.h>
  #include <x86/sse4.1.h>
  
++// PowerPC memory barriers. On weakly-ordered hosts (ARM/Switch) the guest's
++// sync/lwsync must lower to real fences or cross-thread publishes may be lost;
++// on strongly-ordered x86 they collapse to compiler barriers as upstream.
++#if defined(__aarch64__) || defined(__arm__) || defined(__SWITCH__)
++#define PPC_SYNC()   std::atomic_thread_fence(std::memory_order_seq_cst)
++#define PPC_LWSYNC() std::atomic_thread_fence(std::memory_order_acq_rel)
++#else
++#define PPC_SYNC()   std::atomic_signal_fence(std::memory_order_seq_cst)
++#define PPC_LWSYNC() std::atomic_signal_fence(std::memory_order_acq_rel)
++#endif
++
 +// GCC does not provide the Clang/MSVC builtins emitted by XenonRecomp.
 +#if defined(__GNUC__) && !defined(__clang__)
 +static inline uint32_t PPCRotateLeft32(uint32_t value, unsigned int shift) noexcept
@@ -233,7 +284,7 @@ index 31a86cd..f067d14 100644
  // SSE3 constants are missing from simde
  #ifndef _MM_DENORMALS_ZERO_MASK
  #define _MM_DENORMALS_ZERO_MASK 0x0040
-@@ -692,9 +712,15 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
+@@ -692,9 +724,15 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
  inline uint64_t __rdtsc()
  {
      uint64_t ret;

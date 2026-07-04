@@ -44,6 +44,13 @@ struct GuestThreadHandle : KernelObject
 #else
     std::thread thread;
 #endif
+#if defined(__SWITCH__)
+    // Kernel handle of the thread (captured at thread entry) and the Horizon
+    // priority requested before the handle became available. Lets
+    // KeSetBasePriorityThread work cross-thread and pre-start.
+    std::atomic<uint32_t> kernelHandle = 0;
+    std::atomic<int32_t> pendingHorizonPriority = -1;
+#endif
 
     GuestThreadHandle(const GuestThreadParams& params);
     ~GuestThreadHandle() override;

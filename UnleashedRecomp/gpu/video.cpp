@@ -37,6 +37,16 @@
 #include <magic_enum/magic_enum.hpp>
 #endif
 
+#if defined(__SWITCH__)
+// Minimal libnx declarations (avoids pulling <switch.h> macros into this TU).
+extern "C"
+{
+    void svcSleepThread(int64_t nano);
+    uint32_t svcSetThreadPriority(uint32_t handle, uint32_t priority);
+    uint32_t threadGetCurHandle(void);
+}
+#endif
+
 #define UNLEASHED_RECOMP
 #include "../../tools/XenosRecomp/XenosRecomp/shader_common.h"
 
@@ -1875,6 +1885,16 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         break;
     }
 
+#if defined(__SWITCH__)
+    // presentWait is compiled out on the VI/NVK path, so Auto resolves to
+    // double buffering — under Mesa 26.1.1's WSI the acquire then blocks an
+    // extra vblank and the game tick halves (the frame-synced sound engine
+    // audibly stutters at exactly half rate). Triple buffer unless the user
+    // explicitly opted out.
+    if (Config::TripleBuffering == ETripleBuffering::Auto)
+        bufferCount = 3;
+#endif
+
     g_swapChain = g_queue->createSwapChain(GameWindow::s_renderWindow, bufferCount, BACKBUFFER_FORMAT, Config::MaxFrameLatency);
     g_swapChain->setVsyncEnabled(Config::VSync);
     g_swapChainValid = !g_swapChain->needsResize();
@@ -2863,10 +2883,17 @@ void Video::Present()
 
         if (now < s_next)
         {
+#if defined(__SWITCH__)
+            // svcSleepThread is precise to microseconds; the 2ms yield spin
+            // below both burns a shared core and loses to the scheduler.
+            std::this_thread::sleep_until(s_next);
+            now = std::chrono::steady_clock::now();
+#else
             std::this_thread::sleep_for(std::chrono::floor<std::chrono::milliseconds>(s_next - now - 2ms));
 
             while ((now = std::chrono::steady_clock::now()) < s_next)
                 std::this_thread::yield();
+#endif
         }
         else
         {
@@ -6269,6 +6296,11 @@ static void PipelineCompilerThread()
     int threadPriority = THREAD_PRIORITY_LOWEST;
     SetThreadPriority(GetCurrentThread(), threadPriority);
     GuestThread::SetThreadName(GetCurrentThreadId(), "Pipeline Compiler Thread");
+#elif defined(__SWITCH__)
+    // Lowest priority: only run when a core is otherwise idle, mirroring the
+    // THREAD_PRIORITY_LOWEST intent above. Three shared cores cannot afford
+    // shader compilation competing with game threads.
+    svcSetThreadPriority(threadGetCurHandle(), 0x3B);
 #endif
 
     std::unique_ptr<GuestThreadContext> ctx;
@@ -7123,6 +7155,8 @@ static void PipelineTaskConsumerThread()
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
     GuestThread::SetThreadName(GetCurrentThreadId(), "Pipeline Task Consumer Thread");
+#elif defined(__SWITCH__)
+    svcSetThreadPriority(threadGetCurHandle(), 0x3B);
 #endif
 
     std::vector<PipelineTask> localPipelineTaskQueue;
@@ -7372,7 +7406,14 @@ static void PipelineTaskConsumerThread()
         if (allHandled)
             localPipelineTaskQueue.clear();
 
+#if defined(__SWITCH__)
+        // Retry throttle while resources finish loading; a yield spin here
+        // burns a shared core for the whole loading screen.
+        if (!allHandled)
+            svcSleepThread(500000);
+#else
         std::this_thread::yield();
+#endif
     }
 }
 

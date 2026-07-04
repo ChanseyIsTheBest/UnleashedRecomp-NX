@@ -18,13 +18,22 @@
 #include <ntstatus.h>
 #endif
 
+#if defined(__SWITCH__)
+#include <os/switch_atomic_wait.h>
+#endif
+
 static std::atomic<uint32_t> g_dispatcherGeneration;
 static std::mutex g_dispatcherMutex;
 static std::condition_variable g_dispatcherCv;
 
 static void NotifyDispatcherWaiters()
 {
-    g_dispatcherGeneration.fetch_add(1, std::memory_order_release);
+    // Advance the generation under the mutex so KeWaitForMultipleObjects waiters
+    // reliably observe it (an atomic alone permits a lost wakeup).
+    {
+        std::lock_guard lock(g_dispatcherMutex);
+        g_dispatcherGeneration.fetch_add(1, std::memory_order_release);
+    }
     g_dispatcherCv.notify_all();
 }
 
@@ -32,6 +41,15 @@ static void WaitDispatcherGeneration(uint32_t generation)
 {
     std::unique_lock lock(g_dispatcherMutex);
     g_dispatcherCv.wait(lock, [&]
+    {
+        return g_dispatcherGeneration.load(std::memory_order_acquire) != generation;
+    });
+}
+
+static bool WaitDispatcherGenerationFor(uint32_t generation, uint32_t timeoutMs)
+{
+    std::unique_lock lock(g_dispatcherMutex);
+    return g_dispatcherCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&]
     {
         return g_dispatcherGeneration.load(std::memory_order_acquire) != generation;
     });
@@ -75,7 +93,11 @@ struct Event final : KernelObject, HostObject<XKEVENT>
         }
         else
         {
-            assert(false && "Unhandled timeout value.");
+            if (!cv.wait_for(lock, std::chrono::milliseconds(timeout), [&] { return signaled; }))
+                return STATUS_TIMEOUT;
+
+            if (!manualReset)
+                signaled = false;
         }
 
         return STATUS_SUCCESS;
@@ -150,14 +172,16 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         {
             cv.wait(lock, [&] { return count != 0; });
             --count;
-
-            return STATUS_SUCCESS;
         }
         else
         {
-            assert(false && "Unhandled timeout value.");
-            return STATUS_TIMEOUT;
+            if (!cv.wait_for(lock, std::chrono::milliseconds(timeout), [&] { return count != 0; }))
+                return STATUS_TIMEOUT;
+
+            --count;
         }
+
+        return STATUS_SUCCESS;
     }
 
     bool IsSignaled() const override
@@ -440,7 +464,6 @@ uint32_t FscSetCacheElementCount()
 uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
-    assert(timeout == 0 || timeout == INFINITE);
 
     if (IsKernelObject(Handle))
     {
@@ -607,6 +630,10 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* 
 
 #ifdef _WIN32
     Sleep(timeout);
+#elif defined(__SWITCH__)
+    // Sleep(0) semantics need a real sleep on Horizon: yield() never runs
+    // lower-priority threads queued on this core.
+    svcSleepThread(timeout == 0 ? 10000 : timeout * 1000000ll);
 #else
     if (timeout == 0)
         std::this_thread::yield();
@@ -680,6 +707,31 @@ void KeSetBasePriorityThread(GuestThreadHandle* hThread, int priority)
     }
 
     SetThreadPriority(hThread == GetKernelObject(CURRENT_THREAD_HANDLE) ? GetCurrentThread() : hThread->thread.native_handle(), priority);
+#elif defined(__SWITCH__)
+    // NT delta (-15..15, higher = more important) maps onto Horizon 28..48
+    // (lower = more important) around the 0x2C default.
+    if (priority > 15)
+        priority = 15;
+    else if (priority < -15)
+        priority = -15;
+
+    int32_t horizonPriority = 0x2C - priority;
+    if (horizonPriority < 0x1C)
+        horizonPriority = 0x1C;
+    else if (horizonPriority > 0x30)
+        horizonPriority = 0x30;
+
+    if (hThread == GetKernelObject(CURRENT_THREAD_HANDLE))
+    {
+        svcSetThreadPriority(threadGetCurHandle(), static_cast<uint32_t>(horizonPriority));
+    }
+    else
+    {
+        hThread->pendingHorizonPriority.store(horizonPriority, std::memory_order_release);
+        uint32_t handle = hThread->kernelHandle.load(std::memory_order_acquire);
+        if (handle != 0)
+            svcSetThreadPriority(handle, static_cast<uint32_t>(horizonPriority));
+    }
 #endif
 }
 
@@ -721,7 +773,9 @@ void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
 
     std::atomic_ref owningThread(cs->OwningThread);
     owningThread.store(0);
-#if !defined(__SWITCH__)
+#if defined(__SWITCH__)
+    SwitchAtomicNotifyOne32(&cs->OwningThread);
+#else
     owningThread.notify_one();
 #endif
 }
@@ -733,7 +787,7 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
 
     std::atomic_ref owningThread(cs->OwningThread);
 
-    while (true) 
+    while (true)
     {
         uint32_t previousOwner = 0;
 
@@ -744,7 +798,7 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
         }
 
 #if defined(__SWITCH__)
-        std::this_thread::yield();
+        SwitchAtomicWait32(&cs->OwningThread, previousOwner);
 #else
         owningThread.wait(previousOwner);
 #endif
@@ -812,7 +866,13 @@ void KfAcquireSpinLock(uint32_t* spinLock)
         if (spinLockRef.compare_exchange_weak(expected, g_ppcContext->r13.u32))
             break;
 
+#if defined(__SWITCH__)
+        // yield() cannot run a lower-priority owner queued on this core;
+        // a real (bounded) sleep can.
+        svcSleepThread(10000);
+#else
         std::this_thread::yield();
+#endif
     }
 }
 
@@ -859,7 +919,13 @@ void KeAcquireSpinLockAtRaisedIrql(uint32_t* spinLock)
         if (spinLockRef.compare_exchange_weak(expected, g_ppcContext->r13.u32))
             break;
 
+#if defined(__SWITCH__)
+        // yield() cannot run a lower-priority owner queued on this core;
+        // a real (bounded) sleep can.
+        svcSleepThread(10000);
+#else
         std::this_thread::yield();
+#endif
     }
 }
 
@@ -1050,7 +1116,6 @@ bool KeResetEvent(XKEVENT* pEvent)
 uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitReason, uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
 {
     const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
-    assert(timeout == 0 || timeout == INFINITE);
 
     switch (Object->Type)
     {
@@ -1532,8 +1597,28 @@ void NetDll_XNetGetTitleXnAddr()
 
 uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* Objects, uint32_t WaitType, uint32_t WaitReason, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
-    const uint64_t timeout = GuestTimeoutToMilliseconds(Timeout);
-    assert(timeout == 0 || timeout == INFINITE);
+    const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+
+    const bool hasDeadline = timeout != 0 && timeout != INFINITE;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(hasDeadline ? timeout : 0);
+
+    // Waits until either the dispatcher generation moves or the caller's
+    // deadline passes; returns false when the deadline is the reason.
+    auto waitForGeneration = [&](uint32_t generation) -> bool
+    {
+        if (!hasDeadline)
+        {
+            WaitDispatcherGeneration(generation);
+            return true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return false;
+
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        return WaitDispatcherGenerationFor(generation, uint32_t(remaining) + 1);
+    };
 
     auto queryObject = [](XDISPATCHER_HEADER& header) -> KernelObject*
     {
@@ -1591,7 +1676,8 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
             if (timeout == 0)
                 return STATUS_TIMEOUT;
 
-            WaitDispatcherGeneration(generation);
+            if (!waitForGeneration(generation))
+                return STATUS_TIMEOUT;
         }
     }
     else
@@ -1623,7 +1709,8 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
             if (timeout == 0)
                 return STATUS_TIMEOUT;
 
-            WaitDispatcherGeneration(generation);
+            if (!waitForGeneration(generation))
+                return STATUS_TIMEOUT;
         }
     }
 

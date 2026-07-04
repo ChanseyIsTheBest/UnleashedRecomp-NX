@@ -97,11 +97,13 @@ if (UNLEASHED_RECOMP_SWITCH)
     set(UNLEASHED_RECOMP_OS_CXX_SOURCES
         "os/switch/logger_switch.cpp"
         "os/switch/media_switch.cpp"
+        "os/switch/nvk_switch_stubs.c"
         "os/switch/process_switch.cpp"
         "os/switch/runtime_switch.cpp"
         "os/switch/user_switch.cpp"
         "os/switch/version_switch.cpp"
     )
+    set_source_files_properties("os/switch/nvk_switch_stubs.c" PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 elseif (WIN32)
     set(UNLEASHED_RECOMP_OS_CXX_SOURCES
         "os/win32/logger_win32.cpp"
@@ -386,7 +388,7 @@ if (UNLEASHED_RECOMP_SWITCH)
     set(UNLEASHED_RECOMP_HOST_FILE_TO_C "${UNLEASHED_RECOMP_HOST_TOOLS_DIR}/tools/file_to_c/file_to_c" CACHE FILEPATH "Host file_to_c executable.")
     set(UNLEASHED_RECOMP_HOST_X_DECOMPRESS "${UNLEASHED_RECOMP_HOST_TOOLS_DIR}/tools/x_decompress/x_decompress" CACHE FILEPATH "Host x_decompress executable.")
     set(UNLEASHED_RECOMP_HOST_XENON_RECOMP "${UNLEASHED_RECOMP_HOST_TOOLS_DIR}/tools/XenonRecomp/XenonRecomp/XenonRecomp" CACHE FILEPATH "Host XenonRecomp executable.")
-    set(UNLEASHED_RECOMP_HOST_XENOS_RECOMP "${UNLEASHED_RECOMP_HOST_TOOLS_DIR}/tools/XenosRecomp/XenosRecomp/XenonRecomp" CACHE FILEPATH "Host XenosRecomp executable.")
+    set(UNLEASHED_RECOMP_HOST_XENOS_RECOMP "${UNLEASHED_RECOMP_HOST_TOOLS_DIR}/tools/XenosRecomp/XenosRecomp/XenosRecomp" CACHE FILEPATH "Host XenosRecomp executable.")
 
     target_compile_definitions(UnleashedRecomp PRIVATE
         "UNLEASHED_RECOMP_SWITCH"
@@ -402,10 +404,24 @@ find_package(CURL REQUIRED)
 
 if (UNLEASHED_RECOMP_SWITCH)
     set(UNLEASHED_RECOMP_HOST_DXC_ROOT "${UNLEASHED_RECOMP_TOOLS_ROOT}/XenosRecomp/thirdparty/dxc-bin")
-    set(DIRECTX_DXC_TOOL
-        "${CMAKE_COMMAND}" "-E" "env" "LD_LIBRARY_PATH=${UNLEASHED_RECOMP_HOST_DXC_ROOT}/lib/x64"
-        "${UNLEASHED_RECOMP_HOST_DXC_ROOT}/bin/x64/dxc-linux"
-    )
+    if (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        set(UNLEASHED_RECOMP_HOST_DXC_ARCH "arm64")
+    else()
+        set(UNLEASHED_RECOMP_HOST_DXC_ARCH "x64")
+    endif()
+    if (CMAKE_HOST_WIN32)
+        set(DIRECTX_DXC_TOOL "${UNLEASHED_RECOMP_HOST_DXC_ROOT}/bin/${UNLEASHED_RECOMP_HOST_DXC_ARCH}/dxc.exe")
+    elseif (CMAKE_HOST_APPLE)
+        set(DIRECTX_DXC_TOOL
+            "${CMAKE_COMMAND}" "-E" "env" "DYLD_LIBRARY_PATH=${UNLEASHED_RECOMP_HOST_DXC_ROOT}/lib/${UNLEASHED_RECOMP_HOST_DXC_ARCH}"
+            "${UNLEASHED_RECOMP_HOST_DXC_ROOT}/bin/${UNLEASHED_RECOMP_HOST_DXC_ARCH}/dxc-macos"
+        )
+    else()
+        set(DIRECTX_DXC_TOOL
+            "${CMAKE_COMMAND}" "-E" "env" "LD_LIBRARY_PATH=${UNLEASHED_RECOMP_HOST_DXC_ROOT}/lib/x64"
+            "${UNLEASHED_RECOMP_HOST_DXC_ROOT}/bin/x64/dxc-linux"
+        )
+    endif()
 endif()
 
 if (UNLEASHED_RECOMP_D3D12)

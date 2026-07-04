@@ -89,15 +89,7 @@ void KiSystemStartup()
         std::_Exit(1);
     }
 
-#if defined(__SWITCH__)
-    LOGFN("Switch PPC memory ready: base=0x{:016X}", g_memory.switchSelectedBase);
-#endif
-
     g_userHeap.Init();
-
-#if defined(__SWITCH__)
-    LOGFN("Switch guest heap ready: heap={}, physicalHeap={}", static_cast<const void*>(g_userHeap.heap), static_cast<const void*>(g_userHeap.physicalHeap));
-#endif
 
     const auto gameContent = XamMakeContent(XCONTENTTYPE_RESERVED, "Game");
     const auto updateContent = XamMakeContent(XCONTENTTYPE_RESERVED, "Update");
@@ -106,16 +98,8 @@ void KiSystemStartup()
     XamRegisterContent(gameContent, gamePath);
     XamRegisterContent(updateContent, updatePath);
 
-#if defined(__SWITCH__)
-    LOGFN("Switch content roots prepared: game='{}', update='{}'", gamePath, updatePath);
-#endif
-
     const auto saveFilePath = GetSaveFilePath(true);
     bool saveFileExists = std::filesystem::exists(saveFilePath);
-
-#if defined(__SWITCH__)
-    LOGFN("Switch save probe: path='{}', exists={}", saveFilePath.string(), saveFileExists);
-#endif
 
     if (!saveFileExists)
     {
@@ -128,41 +112,22 @@ void KiSystemStartup()
             std::filesystem::copy_file(GetSaveFilePath(false), saveFilePath, ec);
             saveFileExists = !ec;
         }
-
-#if defined(__SWITCH__)
-        LOGFN("Switch save fallback copy: path='{}', result={}, ec='{}'",
-            saveFilePath.string(),
-            saveFileExists,
-            ec.message());
-#endif
     }
 
     if (saveFileExists)
     {
         std::u8string savePathU8 = saveFilePath.parent_path().u8string();
         XamRegisterContent(XamMakeContent(XCONTENTTYPE_SAVEDATA, "SYS-DATA"), (const char*)(savePathU8.c_str()));
-
-#if defined(__SWITCH__)
-        LOGFN("Switch save content registered: root='{}'", reinterpret_cast<const char*>(savePathU8.c_str()));
-#endif
     }
 
     // Mount game
-    const auto gameMountResult = XamContentCreateEx(0, "game", &gameContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
-    const auto updateMountResult = XamContentCreateEx(0, "update", &updateContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
+    XamContentCreateEx(0, "game", &gameContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
+    XamContentCreateEx(0, "update", &updateContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
 
     // OS mounts game data to D:
-    const auto dMountResult = XamContentCreateEx(0, "D", &gameContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
-
-#if defined(__SWITCH__)
-    LOGFN("Switch content mounts: game=0x{:08X}, update=0x{:08X}, D=0x{:08X}",
-        gameMountResult,
-        updateMountResult,
-        dMountResult);
-#endif
+    XamContentCreateEx(0, "D", &gameContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
 
     std::error_code ec;
-    uint32_t dlcCount = 0;
     for (auto& file : std::filesystem::directory_iterator(GetGamePath() / "dlc", ec))
     {
         if (file.is_directory())
@@ -170,26 +135,14 @@ void KiSystemStartup()
             std::u8string fileNameU8 = file.path().filename().u8string();
             std::u8string filePathU8 = file.path().u8string();
             XamRegisterContent(XamMakeContent(XCONTENTTYPE_DLC, (const char*)(fileNameU8.c_str())), (const char*)(filePathU8.c_str()));
-            ++dlcCount;
         }
     }
-
-#if defined(__SWITCH__)
-    LOGFN("Switch DLC scan: root='{}', count={}, ec='{}'",
-        (GetGamePath() / "dlc").string(),
-        dlcCount,
-        ec.message());
-#endif
 
     XAudioInitializeSystem();
 }
 
 uint32_t LdrLoadModule(const std::filesystem::path &path)
 {
-#if defined(__SWITCH__)
-    LOGFN("Switch loading module: {}", path.string());
-#endif
-
     auto loadResult = LoadFile(path);
     if (loadResult.empty())
     {
@@ -200,25 +153,11 @@ uint32_t LdrLoadModule(const std::filesystem::path &path)
         return 0;
     }
 
-#if defined(__SWITCH__)
-    LOGFN("Switch module file loaded: bytes={}", loadResult.size());
-#endif
-
     auto* header = reinterpret_cast<const Xex2Header*>(loadResult.data());
     auto* security = reinterpret_cast<const Xex2SecurityInfo*>(loadResult.data() + header->securityOffset);
     const auto* fileFormatInfo = reinterpret_cast<const Xex2OptFileFormatInfo*>(getOptHeaderPtr(loadResult.data(), XEX_HEADER_FILE_FORMAT_INFO));
     auto entry = *reinterpret_cast<const uint32_t*>(getOptHeaderPtr(loadResult.data(), XEX_HEADER_ENTRY_POINT));
     ByteSwapInplace(entry);
-
-#if defined(__SWITCH__)
-    LOGFN("Switch XEX header: headerSize=0x{:X}, securityOffset=0x{:X}, load=0x{:08X}, imageSize=0x{:X}, compression={}, entry=0x{:08X}",
-        static_cast<uint32_t>(header->headerSize),
-        static_cast<uint32_t>(header->securityOffset),
-        static_cast<uint32_t>(security->loadAddress),
-        static_cast<uint32_t>(security->imageSize),
-        static_cast<uint16_t>(fileFormatInfo->compressionType),
-        entry);
-#endif
 
     auto srcData = loadResult.data() + header->headerSize;
     auto destData = reinterpret_cast<uint8_t*>(g_memory.Translate(security->loadAddress));
@@ -255,16 +194,6 @@ uint32_t LdrLoadModule(const std::filesystem::path &path)
 
     g_xdbfWrapper = XDBFWrapper((uint8_t*)g_memory.Translate(res->offset.get()), res->sizeOfData);
 
-#if defined(__SWITCH__)
-    LOGFN("Switch module ready: entry=0x{:08X}, load=0x{:08X}, imageSize=0x{:X}, compression={}, xdbf=0x{:08X}+0x{:X}",
-        entry,
-        static_cast<uint32_t>(security->loadAddress),
-        static_cast<uint32_t>(security->imageSize),
-        static_cast<uint16_t>(fileFormatInfo->compressionType),
-        static_cast<uint32_t>(res->offset.get()),
-        static_cast<uint32_t>(res->sizeOfData));
-#endif
-
     return entry;
 }
 
@@ -295,6 +224,13 @@ int main(int argc, char *argv[])
 {
 #ifdef _WIN32
     timeBeginPeriod(1);
+#endif
+
+#if defined(__SWITCH__)
+    // Enable NVK's async submit thread;
+    // (submission overlaps the next frame). Must be set before the Vulkan
+    // instance is created.
+    setenv("MESA_VK_ENABLE_SUBMIT_THREAD", "1", 1);
 #endif
 
     os::process::CheckConsole();
@@ -423,36 +359,17 @@ int main(int argc, char *argv[])
 
     HostStartup();
 
-#if defined(__SWITCH__)
-    LOGN("Switch HostStartup completed");
-#endif
-
     std::filesystem::path modulePath;
     bool isGameInstalled = Installer::checkGameInstall(GetGamePath(), modulePath);
     bool runInstallerWizard = forceInstaller || forceDLCInstaller || !isGameInstalled;
 
-#if defined(__SWITCH__)
-    LOGFN("Switch install check: installed={}, runInstaller={}, module='{}'",
-        isGameInstalled,
-        runInstallerWizard,
-        modulePath.string());
-#endif
-
     if (runInstallerWizard)
     {
-#if defined(__SWITCH__)
-        LOGN("Switch creating host video device for installer");
-#endif
-
         if (!Video::CreateHostDevice(sdlVideoDriver, graphicsApiRetry))
         {
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("Video_BackendError").c_str(), GameWindow::s_pWindow);
             std::_Exit(1);
         }
-
-#if defined(__SWITCH__)
-        LOGN("Switch host video device ready for installer");
-#endif
 
         if (!InstallerWizard::Run(GetGamePath(), isGameInstalled && forceDLCInstaller))
         {
@@ -471,53 +388,25 @@ int main(int argc, char *argv[])
 
     ModLoader::Init();
 
-#if defined(__SWITCH__)
-    LOGN("Switch ModLoader initialized");
-#endif
-
     if (!PersistentStorageManager::LoadBinary())
         LOGFN_ERROR("Failed to load persistent storage binary... (status code {})", (int)PersistentStorageManager::BinStatus);
 
-#if defined(__SWITCH__)
-    LOGN("Switch persistent storage step completed");
-#endif
-
     KiSystemStartup();
-
-#if defined(__SWITCH__)
-    LOGN("Switch kernel startup completed");
-#endif
 
     uint32_t entry = LdrLoadModule(modulePath);
 
     if (!runInstallerWizard)
     {
-#if defined(__SWITCH__)
-        LOGN("Switch creating host video device for game");
-#endif
-
         if (!Video::CreateHostDevice(sdlVideoDriver, graphicsApiRetry))
         {
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("Video_BackendError").c_str(), GameWindow::s_pWindow);
             std::_Exit(1);
         }
-
-#if defined(__SWITCH__)
-        LOGN("Switch host video device ready for game");
-#endif
     }
 
     Video::StartPipelinePrecompilation();
 
-#if defined(__SWITCH__)
-    LOGFN("Switch starting guest entry: 0x{:08X}", entry);
-#endif
-
     GuestThread::Start({ entry, 0, 0 });
-
-#if defined(__SWITCH__)
-    LOGN("Switch guest entry returned");
-#endif
 
     return 0;
 }

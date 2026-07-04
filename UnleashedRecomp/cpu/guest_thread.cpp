@@ -6,6 +6,15 @@
 #include <os/logger.h>
 #include "ppc_context.h"
 
+#if defined(__SWITCH__)
+// Minimal libnx declarations (avoids pulling <switch.h> macros into this TU).
+extern "C"
+{
+    uint32_t svcSetThreadPriority(uint32_t handle, uint32_t priority);
+    uint32_t threadGetCurHandle(void);
+}
+#endif
+
 constexpr size_t PCR_SIZE = 0xAB0;
 constexpr size_t TLS_SIZE = 0x100;
 constexpr size_t TEB_SIZE = 0x2E0;
@@ -76,7 +85,20 @@ static void* GuestThreadFunc(void* arg)
 static void GuestThreadFunc(GuestThreadHandle* hThread)
 {
 #endif
+#if defined(__SWITCH__)
+    // Publish our kernel handle so KeSetBasePriorityThread can adjust this
+    // thread from outside, and apply any priority requested before we ran.
+    hThread->kernelHandle.store(threadGetCurHandle(), std::memory_order_release);
+    int32_t pendingPriority = hThread->pendingHorizonPriority.load(std::memory_order_acquire);
+    if (pendingPriority >= 0)
+        svcSetThreadPriority(threadGetCurHandle(), static_cast<uint32_t>(pendingPriority));
+#endif
     hThread->WaitUntilResumed();
+#if defined(__SWITCH__)
+    pendingPriority = hThread->pendingHorizonPriority.load(std::memory_order_acquire);
+    if (pendingPriority >= 0)
+        svcSetThreadPriority(threadGetCurHandle(), static_cast<uint32_t>(pendingPriority));
+#endif
     GuestThread::Start(hThread->params);
 #ifdef USE_PTHREAD
     return nullptr;

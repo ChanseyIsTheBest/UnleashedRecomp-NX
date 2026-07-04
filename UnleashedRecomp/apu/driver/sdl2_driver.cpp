@@ -9,6 +9,7 @@
 
 #if defined(__SWITCH__)
 #include <pthread.h>
+#include <switch.h>
 #endif
 
 static PPCFunc* g_clientCallback{};
@@ -33,7 +34,13 @@ static void CreateAudioDevice()
     desired.freq = XAUDIO_SAMPLES_HZ;
     desired.format = AUDIO_F32SYS;
     desired.channels = surround ? XAUDIO_NUM_CHANNELS : 2;
+#if defined(__SWITCH__)
+    // Give audren device-side headroom; a single 256-sample period is too tight
+    // for the shared cores.
+    desired.samples = XAUDIO_NUM_SAMPLES * 4;
+#else
     desired.samples = XAUDIO_NUM_SAMPLES;
+#endif
     g_audioDevice = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, allowedChanges);
 
     if (g_audioDevice && obtained.channels != 2 && obtained.channels != XAUDIO_NUM_CHANNELS) // This check may fail only when surround sound is enabled.
@@ -63,10 +70,6 @@ void XAudioInitializeSystem()
     SDL_setenv("SDL_AUDIODRIVER", "wasapi", true);
 #endif
 
-#if defined(__SWITCH__)
-    XAudioSetGuestCallbacksEnabled(false);
-#endif
-
     SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_APP_NAME, "Unleashed Recompiled");
 
@@ -86,34 +89,10 @@ static bool g_audioThreadCreated{};
 static std::unique_ptr<std::thread> g_audioThread;
 #endif
 static std::atomic<bool> g_audioThreadShouldExit;
-static std::atomic<uint32_t> g_audioCallbackCount;
-static std::atomic<uint32_t> g_audioSubmitCount;
-#if defined(__SWITCH__)
-static std::atomic<bool> g_audioGuestCallbacksEnabled;
-#endif
-
-void XAudioSetGuestCallbacksEnabled(bool enabled)
-{
-#if defined(__SWITCH__)
-    g_audioGuestCallbacksEnabled.store(enabled, std::memory_order_release);
-#else
-    (void)enabled;
-#endif
-}
-
-static bool AreGuestCallbacksEnabled()
-{
-#if defined(__SWITCH__)
-    return g_audioGuestCallbacksEnabled.load(std::memory_order_acquire);
-#else
-    return true;
-#endif
-}
 
 #if defined(__SWITCH__)
 static void* AudioThread(void*)
 #else
-
 static void AudioThread()
 #endif
 {
@@ -123,24 +102,40 @@ static void AudioThread()
 
     size_t channels = g_downMixToStereo ? 2 : XAUDIO_NUM_CHANNELS;
 
+#if defined(__SWITCH__)
+    // Keep the pump above the game's bulk worker threads so it holds its cadence.
+    svcSetThreadPriority(threadGetCurHandle(), 0x20);
+
+    // Absolute deadline advanced by exactly one interval per tick: the reference
+    // pump's fixed-rate 187.5Hz schedule (0x137fa0). Driving the guest mixer at a
+    // steady one-block-per-tick is what keeps its voice buffers full.
+    constexpr auto PUMP_INTERVAL = std::chrono::nanoseconds(1000000000ll * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ);
+    auto pumpDeadline = std::chrono::steady_clock::now();
+#endif
+
     while (!g_audioThreadShouldExit.load(std::memory_order_acquire))
     {
         uint32_t queuedAudioSize = g_audioDevice ? SDL_GetQueuedAudioSize(g_audioDevice) : 0;
         constexpr size_t MAX_LATENCY = 10;
         const size_t callbackAudioSize = channels * XAUDIO_NUM_SAMPLES * sizeof(float);
 
-        if ((queuedAudioSize / callbackAudioSize) <= MAX_LATENCY)
+        if ((queuedAudioSize / callbackAudioSize) <= MAX_LATENCY && g_clientCallback != nullptr)
         {
-            if (AreGuestCallbacksEnabled() && g_clientCallback != nullptr)
-            {
-                if (ctx == nullptr)
-                    ctx = std::make_unique<GuestThreadContext>(0);
+            if (ctx == nullptr)
+                ctx = std::make_unique<GuestThreadContext>(0);
 
-                ctx->ppcContext.r3.u32 = g_clientCallbackParam;
-                g_clientCallback(ctx->ppcContext, g_memory.base);
-            }
+            ctx->ppcContext.r3.u32 = g_clientCallbackParam;
+            g_clientCallback(ctx->ppcContext, g_memory.base);
         }
 
+#if defined(__SWITCH__)
+        pumpDeadline += PUMP_INTERVAL;
+        auto now = std::chrono::steady_clock::now();
+        if (now >= pumpDeadline)
+            pumpDeadline = now + PUMP_INTERVAL;
+        else
+            std::this_thread::sleep_until(pumpDeadline);
+#else
         auto now = std::chrono::steady_clock::now();
         constexpr auto INTERVAL = 1000000000ns * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ;
         auto next = now + (INTERVAL - now.time_since_epoch() % INTERVAL);
@@ -149,6 +144,7 @@ static void AudioThread()
 
         while (std::chrono::steady_clock::now() < next)
             std::this_thread::yield();
+#endif
     }
 }
 
@@ -173,9 +169,6 @@ static void CreateAudioThread()
     }
 
     g_audioThreadCreated = true;
-    LOGFN("Switch XAudio thread created: stackBytes={}, outputReady={}",
-        AUDIO_THREAD_STACK_SIZE,
-        g_audioDeviceReady);
 #else
     g_audioThread = std::make_unique<std::thread>(AudioThread);
 #endif

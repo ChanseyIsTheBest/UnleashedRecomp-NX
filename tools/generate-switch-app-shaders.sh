@@ -7,27 +7,31 @@ shader_dir="${root_dir}/UnleashedRecomp/gpu/shader"
 dxc_root="${root_dir}/tools/XenosRecomp/thirdparty/dxc-bin"
 
 case "$(uname -m)" in
-  arm64|aarch64)
-    dxc_arch="arm64"
+  arm64|aarch64) dxc_arch="arm64" ;;
+  x86_64|amd64)  dxc_arch="x64" ;;
+  *) echo "Unsupported host architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    # The arm64 dxc build emits invalid SPIR-V for some shaders; the x64 build
+    # runs fine under emulation on Windows ARM64.
+    dxc="${dxc_root}/bin/x64/dxc.exe"
     ;;
-  x86_64|amd64)
-    dxc_arch="x64"
+  Darwin)
+    dxc="${dxc_root}/bin/${dxc_arch}/dxc-macos"
+    export DYLD_LIBRARY_PATH="${dxc_root}/lib/${dxc_arch}${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
     ;;
   *)
-    echo "Unsupported host architecture for bundled macOS DXC: $(uname -m)" >&2
-    exit 1
+    dxc="${dxc_root}/bin/${dxc_arch}/dxc-linux"
+    export LD_LIBRARY_PATH="${dxc_root}/lib/${dxc_arch}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     ;;
 esac
 
-dxc="${dxc_root}/bin/${dxc_arch}/dxc-macos"
-lib_dir="${dxc_root}/lib/${dxc_arch}"
-
 if [[ ! -x "${dxc}" ]]; then
-  echo "Missing bundled macOS DXC: ${dxc}" >&2
+  echo "Missing bundled DXC: ${dxc}" >&2
   exit 1
 fi
-
-export DYLD_LIBRARY_PATH="${lib_dir}${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
 
 compile_shader() {
   local name="$1"

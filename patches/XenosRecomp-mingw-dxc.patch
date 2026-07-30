@@ -1,0 +1,22 @@
+diff --git a/XenosRecomp/dxc_compiler.cpp b/XenosRecomp/dxc_compiler.cpp
+index 3386952..e38f614 100644
+--- a/XenosRecomp/dxc_compiler.cpp
++++ b/XenosRecomp/dxc_compiler.cpp
+@@ -1,5 +1,17 @@
+ #include "dxc_compiler.h"
+ 
++// clang-mingw: DXC declares COM interfaces with MSVC __declspec(uuid), but
++// mingw's __uuidof / IID_PPV_ARGS resolve GUIDs via __mingw_uuidof<T>(), which
++// needs mingw-native __CRT_UUID_DECL declarations. Provide them for the
++// interfaces used here, otherwise the link fails with undefined
++// __mingw_uuidof<IDxc...>() symbols.
++#if defined(__MINGW32__)
++__CRT_UUID_DECL(IDxcBlob,      0x8BA5FB08, 0x5195, 0x40e2, 0xAC, 0x58, 0x0D, 0x98, 0x9C, 0x3A, 0x01, 0x02)
++__CRT_UUID_DECL(IDxcBlobUtf8,  0x3DA636C9, 0xBA71, 0x4024, 0xA3, 0x01, 0x30, 0xCB, 0xF1, 0x25, 0x30, 0x5B)
++__CRT_UUID_DECL(IDxcResult,    0x58346CDA, 0xDDE7, 0x4497, 0x94, 0x61, 0x6F, 0x87, 0xAF, 0x5E, 0x06, 0x59)
++__CRT_UUID_DECL(IDxcCompiler3, 0x228B4687, 0x5A6A, 0x4730, 0x90, 0x0C, 0x97, 0x02, 0xB2, 0x20, 0x3F, 0x54)
++#endif
++
+ DxcCompiler::DxcCompiler()
+ {
+     HRESULT hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));

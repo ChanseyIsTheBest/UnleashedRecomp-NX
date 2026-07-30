@@ -11,6 +11,47 @@ option(
     ${UNLEASHED_RECOMP_SWITCH_PREGENERATED_SHADER_CACHE_DEFAULT}
 )
 
+set(
+    UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT ""
+    CACHE FILEPATH
+    "Optional prebuilt Switch shader-cache object. When set, this is linked instead of compiling shader/shader_cache.cpp."
+)
+set(
+    UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT_SHA256 ""
+    CACHE STRING
+    "Optional SHA-256 used to verify UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT at configure time."
+)
+
+set(UNLEASHED_RECOMP_SHADER_CACHE_SOURCE "shader/shader_cache.cpp")
+if (UNLEASHED_RECOMP_SWITCH AND UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT)
+    if (NOT EXISTS "${UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT}")
+        message(FATAL_ERROR
+            "Switch shader-cache object does not exist: ${UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT}")
+    endif()
+
+    if (UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT_SHA256)
+        file(SHA256 "${UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT}" UNLEASHED_RECOMP_SHADER_CACHE_OBJECT_ACTUAL_SHA256)
+        string(TOLOWER "${UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT_SHA256}" UNLEASHED_RECOMP_SHADER_CACHE_OBJECT_EXPECTED_SHA256)
+        string(TOLOWER "${UNLEASHED_RECOMP_SHADER_CACHE_OBJECT_ACTUAL_SHA256}" UNLEASHED_RECOMP_SHADER_CACHE_OBJECT_ACTUAL_SHA256)
+        if (NOT UNLEASHED_RECOMP_SHADER_CACHE_OBJECT_ACTUAL_SHA256 STREQUAL UNLEASHED_RECOMP_SHADER_CACHE_OBJECT_EXPECTED_SHA256)
+            message(FATAL_ERROR
+                "Switch shader-cache object SHA-256 mismatch. Expected "
+                "${UNLEASHED_RECOMP_SHADER_CACHE_OBJECT_EXPECTED_SHA256}, got "
+                "${UNLEASHED_RECOMP_SHADER_CACHE_OBJECT_ACTUAL_SHA256}.")
+        endif()
+    endif()
+
+    get_filename_component(
+        UNLEASHED_RECOMP_SHADER_CACHE_SOURCE
+        "${UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT}"
+        ABSOLUTE
+    )
+    set_source_files_properties(
+        "${UNLEASHED_RECOMP_SHADER_CACHE_SOURCE}"
+        PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE
+    )
+endif()
+
 add_compile_options(
     -fno-strict-aliasing
 )
@@ -96,7 +137,9 @@ file(GLOB XENOS_RECOMP_SOURCES
     "${XENOS_RECOMP_ROOT}/*.cpp"
 )
 
-if (UNLEASHED_RECOMP_SWITCH AND UNLEASHED_RECOMP_SWITCH_USE_PREGENERATED_SHADERS)
+if (UNLEASHED_RECOMP_SWITCH AND UNLEASHED_RECOMP_SWITCH_SHADER_CACHE_OBJECT)
+    message(STATUS "Using prebuilt Switch shader cache object: ${UNLEASHED_RECOMP_SHADER_CACHE_SOURCE}")
+elseif (UNLEASHED_RECOMP_SWITCH AND UNLEASHED_RECOMP_SWITCH_USE_PREGENERATED_SHADERS)
     message(STATUS "Using pre-generated Switch shader cache: ${CMAKE_CURRENT_SOURCE_DIR}/shader/shader_cache.cpp")
 else()
     target_compile_definitions(XenosRecomp PRIVATE
@@ -124,7 +167,7 @@ endif()
 add_library(UnleashedRecompLib 
     ${UNLEASHED_RECOMP_PPC_RECOMPILED_SOURCES}
     "shader/shader_cache.h"
-    "shader/shader_cache.cpp"
+    "${UNLEASHED_RECOMP_SHADER_CACHE_SOURCE}"
 )
 
 target_include_directories(UnleashedRecompLib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

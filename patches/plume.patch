@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 6a7645a..e4d2d6f 100644
+index 6a7645a..30eeeea 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -13,8 +13,16 @@ string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "Linux" IS_LINUX)
@@ -27,7 +27,31 @@ index 6a7645a..e4d2d6f 100644
  message(STATUS "Plume - Building examples: ${PLUME_BUILD_EXAMPLES}")
  
  # Basic source files that are always included
-@@ -93,6 +102,31 @@ if(D3D12_AGILITY_SDK_ENABLED)
+@@ -65,6 +74,23 @@ elseif(WIN32)
+     )
+ endif()
+ 
++if(PLUME_PLATFORM_SWITCH)
++    set(PLUME_LSFG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../lsfg-vk")
++    file(GLOB PLUME_LSFG_SOURCES CONFIGURE_DEPENDS
++        "${PLUME_LSFG_ROOT}/lsfg-vk-common/src/helpers/*.cpp"
++        "${PLUME_LSFG_ROOT}/lsfg-vk-common/src/vulkan/*.cpp"
++        "${PLUME_LSFG_ROOT}/lsfg-vk-backend/src/*.cpp"
++        "${PLUME_LSFG_ROOT}/lsfg-vk-backend/src/extraction/*.cpp"
++        "${PLUME_LSFG_ROOT}/lsfg-vk-backend/src/helpers/*.cpp"
++        "${PLUME_LSFG_ROOT}/lsfg-vk-backend/src/shaderchains/*.cpp"
++    )
++    list(APPEND PLUME_SOURCES
++        "${PLUME_LSFG_ROOT}/bridge/plume_lsfg_bridge.cpp"
++        "${PLUME_LSFG_ROOT}/bridge/plume_lsfg_bridge.h"
++        ${PLUME_LSFG_SOURCES}
++    )
++endif()
++
+ # Create target
+ add_library(plume STATIC ${PLUME_SOURCES})
+ 
+@@ -93,6 +119,38 @@ if(D3D12_AGILITY_SDK_ENABLED)
      target_link_libraries(plume PRIVATE Microsoft::DirectX-Headers Microsoft::DirectX-Guids Microsoft::DirectX12-Agility)
  endif()
  
@@ -45,6 +69,13 @@ index 6a7645a..e4d2d6f 100644
 +        "${PLUME_SWITCH_DEVKITPRO}/libnx/include"
 +        "${PLUME_SWITCH_DEVKITPRO}/portlibs/switch/include"
 +    )
++    target_include_directories(plume PRIVATE
++        "${PLUME_LSFG_ROOT}/bridge"
++        "${PLUME_LSFG_ROOT}/lsfg-vk-common/include"
++        "${PLUME_LSFG_ROOT}/lsfg-vk-backend/include"
++        "${PLUME_LSFG_ROOT}/lsfg-vk-backend/src"
++    )
++    target_compile_features(plume PUBLIC cxx_std_20)
 +    target_link_libraries(plume PUBLIC
 +        "-Wl,-u,vk_icdGetInstanceProcAddr"
 +        "-Wl,-u,vk_icdNegotiateLoaderICDInterfaceVersion"
@@ -59,12 +90,29 @@ index 6a7645a..e4d2d6f 100644
  # Platform-specific includes
  if(APPLE)
      target_include_directories(plume PRIVATE
-diff --git a/contrib/volk b/contrib/volk
---- a/contrib/volk
-+++ b/contrib/volk
-@@ -1 +1 @@
--Subproject commit be3dbd49bf77052665e96b6c7484af855e7e5f67
-+Subproject commit be3dbd49bf77052665e96b6c7484af855e7e5f67-dirty
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 1c69c35..8c2d0f5 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -12,6 +12,18 @@
+ #include "plume_render_interface_types.h"
+ 
+ namespace plume {
++#if defined(__SWITCH__)
++    struct SwitchFrameGenerationConfig {
++        bool enabled = false;
++        std::string shaderPath;
++        std::string pipelineCachePath;
++        float flowScale = 0.25f;
++        bool performanceMode = true;
++    };
++
++    void ConfigureSwitchFrameGeneration(const SwitchFrameGenerationConfig &config);
++#endif
++
+     // Interfaces.
+ 
+     struct RenderBufferFormattedView {
 diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
 index eeb193b..7bbd30d 100644
 --- a/plume_render_interface_types.h
@@ -93,14 +141,22 @@ index eeb193b..7bbd30d 100644
      typedef HWND RenderWindow;
  #elif defined(__ANDROID__)
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 9103ca8..91f7132 100644
+index 9103ca8..1e14bf2 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
-@@ -15,6 +15,13 @@
+@@ -13,8 +13,21 @@
+ #include <algorithm>
+ #include <cmath>
  #include <climits>
++#include <cstring>
  #include <unordered_map>
  
 +#if defined(__SWITCH__)
++#include "plume_lsfg_bridge.h"
++
++#include <cstdlib>
++#include <filesystem>
++
 +extern "C" {
 +    VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName);
 +    VKAPI_ATTR VkResult VKAPI_CALL vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pSupportedVersion);
@@ -110,7 +166,61 @@ index 9103ca8..91f7132 100644
  #if DLSS_ENABLED
  #   include "render/plume_dlss.h"
  #endif
-@@ -50,6 +57,8 @@ namespace plume {
+@@ -28,6 +41,53 @@
+ // - Fix resource pools.
+ 
+ namespace plume {
++#if defined(__SWITCH__)
++    static SwitchFrameGenerationConfig SwitchFrameGeneration;
++    static bool SwitchFrameGenerationPrepared = false;
++
++    static bool enableNvkNoCbuf() {
++        const char *current = std::getenv("NVK_DEBUG");
++        if (current != nullptr && std::strstr(current, "no_cbuf") != nullptr) {
++            return true;
++        }
++
++        std::string options = current != nullptr ? current : "";
++        if (!options.empty()) {
++            options += ',';
++        }
++
++        options += "no_cbuf";
++        return setenv("NVK_DEBUG", options.c_str(), 1) == 0;
++    }
++
++    void ConfigureSwitchFrameGeneration(const SwitchFrameGenerationConfig &config) {
++        SwitchFrameGeneration = config;
++        SwitchFrameGenerationPrepared = false;
++
++        if (!config.enabled) {
++            return;
++        }
++
++        std::error_code error;
++        if (config.shaderPath.empty() || !std::filesystem::is_regular_file(config.shaderPath, error)) {
++            fprintf(stderr, "LSFG-VK disabled: Lossless.dll was not found at %s.\n", config.shaderPath.c_str());
++            return;
++        }
++
++        if (!enableNvkNoCbuf()) {
++            fprintf(stderr, "LSFG-VK disabled: unable to enable NVK_DEBUG=no_cbuf.\n");
++            return;
++        }
++
++        if (!std::isfinite(SwitchFrameGeneration.flowScale) ||
++                SwitchFrameGeneration.flowScale < 0.125f || SwitchFrameGeneration.flowScale > 0.5f) {
++            SwitchFrameGeneration.flowScale = 0.25f;
++        }
++
++        SwitchFrameGenerationPrepared = true;
++    }
++#endif
++
+     // Backend constants.
+ 
+     // Required buffer alignment for acceleration structures.
+@@ -50,6 +110,8 @@ namespace plume {
  #   endif
  #   if defined(_WIN64)
          VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
@@ -119,7 +229,7 @@ index 9103ca8..91f7132 100644
  #   elif defined(__ANDROID__)
          VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
  #   elif defined(__linux__)
-@@ -60,7 +69,7 @@ namespace plume {
+@@ -60,7 +122,7 @@ namespace plume {
      };
  
      static const std::unordered_set<std::string> OptionalInstanceExtensions = {
@@ -128,7 +238,7 @@ index 9103ca8..91f7132 100644
          // Tells the system Vulkan loader to enumerate portability drivers, if supported.
          VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
  #   endif
-@@ -81,8 +90,10 @@ namespace plume {
+@@ -81,8 +143,10 @@ namespace plume {
          VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
          VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME,
          VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME,
@@ -139,7 +249,7 @@ index 9103ca8..91f7132 100644
          VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
          // Vulkan spec requires this to be enabled if supported by the driver.
          VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
-@@ -2079,6 +2090,18 @@ namespace plume {
+@@ -2079,6 +2143,18 @@ namespace plume {
              fprintf(stderr, "vkCreateWin32SurfaceKHR failed with error code 0x%X.\n", res);
              return;
          }
@@ -158,7 +268,172 @@ index 9103ca8..91f7132 100644
  #   elif defined(SDL_VULKAN_ENABLED)
          VulkanInterface *renderInterface = commandQueue->device->renderInterface;
          SDL_bool sdlRes = SDL_Vulkan_CreateSurface(renderWindow, renderInterface->instance, &surface);
-@@ -2437,6 +2460,17 @@ namespace plume {
+@@ -2158,11 +2234,12 @@ namespace plume {
+             return;
+         }
+ 
+-        // Make sure maxImageCount is never below minImageCount, as it's allowed to be zero.
+-        surfaceCapabilities.maxImageCount = std::max(surfaceCapabilities.minImageCount, surfaceCapabilities.maxImageCount);
++        const uint32_t maximumImageCount = surfaceCapabilities.maxImageCount == 0
++            ? UINT32_MAX
++            : std::max(surfaceCapabilities.minImageCount, surfaceCapabilities.maxImageCount);
+ 
+         // Clamp the requested buffer count between the bounds of the surface capabilities.
+-        this->textureCount = std::clamp(textureCount, surfaceCapabilities.minImageCount, surfaceCapabilities.maxImageCount);
++        this->textureCount = std::clamp(textureCount, surfaceCapabilities.minImageCount, maximumImageCount);
+ 
+         uint32_t surfaceFormatCount = 0;
+         vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &surfaceFormatCount, nullptr);
+@@ -2219,6 +2296,34 @@ namespace plume {
+             return;
+         }
+ 
++#if defined(__SWITCH__)
++        if (SwitchFrameGenerationPrepared && commandQueue->device->frameGenerationCapable) {
++            constexpr VkImageUsageFlags transferUsage =
++                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++            constexpr VkFormatFeatureFlags transferFeatures =
++                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++            VkFormatProperties swapchainProperties = {};
++            VkFormatProperties frameGenerationProperties = {};
++            vkGetPhysicalDeviceFormatProperties(physicalDevice, pickedSurfaceFormat.format, &swapchainProperties);
++            vkGetPhysicalDeviceFormatProperties(physicalDevice, VK_FORMAT_R8G8B8A8_UNORM, &frameGenerationProperties);
++
++            frameGenerationCompatible =
++                pickedSurfaceFormat.format == VK_FORMAT_R8G8B8A8_UNORM &&
++                (surfaceCapabilities.supportedUsageFlags & transferUsage) == transferUsage &&
++                (swapchainProperties.optimalTilingFeatures & transferFeatures) == transferFeatures &&
++                (frameGenerationProperties.optimalTilingFeatures & transferFeatures) == transferFeatures;
++
++            if (frameGenerationCompatible) {
++                const uint32_t desiredImageCount = std::min(this->textureCount + 2, maximumImageCount);
++                this->textureCount = std::max(this->textureCount, desiredImageCount);
++                requiredPresentMode = VK_PRESENT_MODE_FIFO_KHR;
++            }
++            else {
++                fprintf(stderr, "LSFG-VK disabled: the VI swapchain does not support the required transfers.\n");
++            }
++        }
++#endif
++
+         // Parent command queue should track this swap chain.
+         commandQueue->swapChains.insert(this);
+     }
+@@ -2264,7 +2369,59 @@ namespace plume {
+         VkResult res;
+         {
+             const std::scoped_lock queueLock(*commandQueue->queue->mutex);
+-            res = vkQueuePresentKHR(commandQueue->queue->vk, &presentInfo);
++#if defined(__SWITCH__)
++            if (frameGenerationCompatible && frameGenerationRuntime == nullptr && !frameGenerationInitAttempted) {
++                frameGenerationInitAttempted = true;
++
++                std::vector<VkImage> images;
++                images.reserve(textures.size());
++                for (const VulkanTexture &texture : textures) {
++                    images.emplace_back(texture.vk);
++                }
++
++                if (images.size() >= 3) {
++                    LsfgNxCreateInfo info = {};
++                    info.instance = commandQueue->device->renderInterface->instance;
++                    info.physical_device = commandQueue->device->physicalDevice;
++                    info.device = commandQueue->device->vk;
++                    info.queue = commandQueue->queue->vk;
++                    info.queue_family_index = commandQueue->familyIndex;
++                    info.get_instance_proc_addr = vkGetInstanceProcAddr;
++                    info.swapchain = vk;
++                    info.extent = { width, height };
++                    info.swapchain_images = images.data();
++                    info.swapchain_image_count = uint32_t(images.size());
++                    info.shader_dll_path = SwitchFrameGeneration.shaderPath.c_str();
++                    info.pipeline_cache_path = SwitchFrameGeneration.pipelineCachePath.c_str();
++                    info.flow_scale = SwitchFrameGeneration.flowScale;
++                    info.performance_mode = SwitchFrameGeneration.performanceMode;
++                    frameGenerationRuntime = lsfg_nx_create(&info);
++                }
++
++                if (frameGenerationRuntime == nullptr) {
++                    frameGenerationCompatible = false;
++                    fprintf(stderr, "LSFG-VK disabled: runtime initialization failed.\n");
++                }
++                else {
++                    fprintf(stderr, "LSFG-VK 2x frame generation enabled.\n");
++                }
++            }
++
++            if (frameGenerationRuntime != nullptr) {
++                if (!lsfg_nx_present(frameGenerationRuntime, commandQueue->queue->vk, &presentInfo, &res)) {
++                    res = VK_ERROR_INITIALIZATION_FAILED;
++                }
++                if (res == VK_ERROR_INITIALIZATION_FAILED) {
++                    frameGenerationCompatible = false;
++                    releaseFrameGeneration();
++                    fprintf(stderr, "LSFG-VK disabled after a runtime failure.\n");
++                }
++            }
++            else
++#endif
++            {
++                res = vkQueuePresentKHR(commandQueue->queue->vk, &presentInfo);
++            }
+         }
+ 
+ #if defined(__APPLE__)
+@@ -2296,7 +2453,10 @@ namespace plume {
+             return false;
+         }
+ 
+-        // Destroy any image view references to the current swap chain.
++        // Destroy resources tied to the current swap chain.
++#if defined(__SWITCH__)
++        releaseFrameGeneration();
++#endif
+         releaseImageViews();
+ 
+         // We don't actually need to query the surface capabilities but the validation layer seems to cache the valid extents from this call.
+@@ -2312,6 +2472,11 @@ namespace plume {
+         createInfo.imageExtent.height = height;
+         createInfo.imageArrayLayers = 1;
+         createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++#if defined(__SWITCH__)
++        if (frameGenerationCompatible) {
++            createInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++        }
++#endif
+         createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+         createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+         createInfo.compositeAlpha = pickedAlphaFlag;
+@@ -2345,6 +2510,13 @@ namespace plume {
+ 
+         textureCount = retrievedImageCount;
+ 
++#if defined(__SWITCH__)
++        if (frameGenerationCompatible && textureCount < 3) {
++            frameGenerationCompatible = false;
++            fprintf(stderr, "LSFG-VK disabled: fewer than three swapchain images were created.\n");
++        }
++#endif
++
+         std::vector<VkImage> images(textureCount);
+         res = vkGetSwapchainImagesKHR(commandQueue->device->vk, vk, &textureCount, images.data());
+         if (res != VK_SUCCESS) {
+@@ -2380,6 +2552,14 @@ namespace plume {
+     }
+ 
+     void VulkanSwapChain::setVsyncEnabled(bool vsyncEnabled) {
++#if defined(__SWITCH__)
++        // Two FIFO presents provide the generated/original cadence. Immediate mode can replace
++        // or tear away the generated frame before it receives a display interval.
++        if (frameGenerationCompatible) {
++            requiredPresentMode = VK_PRESENT_MODE_FIFO_KHR;
++            return;
++        }
++#endif
+         // Immediate mode must be supported and the presentation mode will only be used on the next resize.
+         // needsResize() will return as true as long as the created and required present mode do not match.
+         if (immediatePresentModeSupported) {
+@@ -2437,6 +2617,17 @@ namespace plume {
  #   elif defined(__ANDROID__)
          dstWidth = ANativeWindow_getWidth(renderWindow);
          dstHeight = ANativeWindow_getHeight(renderWindow);
@@ -176,7 +451,70 @@ index 9103ca8..91f7132 100644
  #   elif defined(__linux__)
          XWindowAttributes attributes;
          XGetWindowAttributes(renderWindow.display, renderWindow.window, &attributes);
-@@ -4398,11 +4432,26 @@ namespace plume {
+@@ -2464,6 +2655,9 @@ namespace plume {
+     }
+ 
+     void VulkanSwapChain::releaseSwapChain() {
++#if defined(__SWITCH__)
++        releaseFrameGeneration();
++#endif
+         if (vk != VK_NULL_HANDLE) {
+             vkDestroySwapchainKHR(commandQueue->device->vk, vk, nullptr);
+             vk = VK_NULL_HANDLE;
+@@ -2479,6 +2673,17 @@ namespace plume {
+         }
+     }
+ 
++#if defined(__SWITCH__)
++    void VulkanSwapChain::releaseFrameGeneration() {
++        if (frameGenerationRuntime != nullptr) {
++            lsfg_nx_destroy(frameGenerationRuntime);
++            frameGenerationRuntime = nullptr;
++        }
++
++        frameGenerationInitAttempted = false;
++    }
++#endif
++
+     // VulkanFramebuffer
+     
+     VulkanFramebuffer::VulkanFramebuffer(VulkanDevice *device, const RenderFramebufferDesc &desc) {
+@@ -3803,6 +4008,15 @@ namespace plume {
+         layoutFeatures.pNext = featuresChain;
+         featuresChain = &layoutFeatures;
+ 
++#if defined(__SWITCH__)
++        VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = {};
++        if (SwitchFrameGenerationPrepared) {
++            timelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
++            timelineFeatures.pNext = featuresChain;
++            featuresChain = &timelineFeatures;
++        }
++#endif
++
+         VkPhysicalDevicePresentIdFeaturesKHR presentIdFeatures = {};
+         VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeatures = {};
+         const bool presentWaitSupported = supportedOptionalExtensions.find(VK_KHR_PRESENT_ID_EXTENSION_NAME) != supportedOptionalExtensions.end() && supportedOptionalExtensions.find(VK_KHR_PRESENT_WAIT_EXTENSION_NAME) != supportedOptionalExtensions.end();
+@@ -3907,6 +4121,18 @@ namespace plume {
+             createDeviceChain = &portabilityFeatures;
+         }
+ 
++#if defined(__SWITCH__)
++        frameGenerationCapable = SwitchFrameGenerationPrepared && timelineFeatures.timelineSemaphore;
++        if (frameGenerationCapable) {
++            timelineFeatures.pNext = createDeviceChain;
++            timelineFeatures.timelineSemaphore = VK_TRUE;
++            createDeviceChain = &timelineFeatures;
++        }
++        else if (SwitchFrameGenerationPrepared) {
++            fprintf(stderr, "LSFG-VK disabled: timeline semaphores are unavailable.\n");
++        }
++#endif
++
+         // Retrieve the information for the queue families.
+         uint32_t queueFamilyCount = 0;
+         vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
+@@ -4398,11 +4624,26 @@ namespace plume {
  #else
      VulkanInterface::VulkanInterface() {
  #endif
@@ -203,7 +541,7 @@ index 9103ca8..91f7132 100644
  
          appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
          appInfo.pApplicationName = "plume";
-@@ -4417,7 +4466,7 @@ namespace plume {
+@@ -4417,7 +4658,7 @@ namespace plume {
          createInfo.ppEnabledLayerNames = nullptr;
          createInfo.enabledLayerCount = 0;
  
@@ -213,7 +551,7 @@ index 9103ca8..91f7132 100644
  #   endif
  
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 73022bb..6bf87f7 100644
+index 73022bb..a1d0ad5 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
 @@ -14,7 +14,12 @@
@@ -230,7 +568,18 @@ index 73022bb..6bf87f7 100644
  #define VK_USE_PLATFORM_WIN32_KHR
  #elif defined(__ANDROID__)
  #define VK_USE_PLATFORM_ANDROID_KHR
-@@ -226,7 +231,7 @@ namespace plume {
+@@ -41,6 +46,10 @@
+ #pragma clang diagnostic pop
+ #endif
+ 
++#if defined(__SWITCH__)
++struct LsfgNxRuntime;
++#endif
++
+ namespace plume {
+     struct VulkanCommandQueue;
+     struct VulkanDevice;
+@@ -226,7 +235,7 @@ namespace plume {
          VulkanCommandQueue *commandQueue = nullptr;
          VkSurfaceKHR surface = VK_NULL_HANDLE;
          RenderWindow renderWindow = {};
@@ -239,3 +588,35 @@ index 73022bb..6bf87f7 100644
          std::unique_ptr<CocoaWindow> windowWrapper;
  #endif
          uint32_t textureCount = 0;
+@@ -243,6 +252,11 @@ namespace plume {
+         uint64_t currentPresentId = 0;
+         bool immediatePresentModeSupported = false;
+         uint32_t maxFrameLatency = 0;
++#if defined(__SWITCH__)
++        LsfgNxRuntime *frameGenerationRuntime = nullptr;
++        bool frameGenerationCompatible = false;
++        bool frameGenerationInitAttempted = false;
++#endif
+ 
+         VulkanSwapChain(VulkanCommandQueue *commandQueue, RenderWindow renderWindow, uint32_t textureCount, RenderFormat format, uint32_t maxFrameLatency);
+         ~VulkanSwapChain() override;
+@@ -263,6 +277,9 @@ namespace plume {
+         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
+         void releaseSwapChain();
+         void releaseImageViews();
++#if defined(__SWITCH__)
++        void releaseFrameGeneration();
++#endif
+     };
+ 
+     struct VulkanFramebuffer : RenderFramebuffer {
+@@ -419,6 +436,9 @@ namespace plume {
+         std::unique_ptr<RenderBuffer> nullBuffer;
+         bool loadStoreOpNoneSupported = false;
+         bool nullDescriptorSupported = false;
++#if defined(__SWITCH__)
++        bool frameGenerationCapable = false;
++#endif
+ 
+         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
+         ~VulkanDevice() override;

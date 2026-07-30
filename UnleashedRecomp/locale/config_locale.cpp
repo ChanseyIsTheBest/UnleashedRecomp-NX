@@ -629,6 +629,18 @@ CONFIG_DEFINE_LOCALE(VSync)
     { ELanguage::Italian,  { "V-Sync", "Sincronizza il gioco con la frequenza d'aggiornamento del display per evitare lo screen tearing." } }
 };
 
+#if defined(__SWITCH__)
+CONFIG_DEFINE_LOCALE(FrameGeneration)
+{
+    { ELanguage::English,  { "Frame Generation", "Generate one intermediate frame between rendered frames using LSFG-VK. This is fixed 2x output: on a 60 Hz display, 30 rendered FPS targets 60 displayed FPS. VSync is forced. Requires Lossless.dll in sdmc:/switch/UnleashedRecomp/lsfg/. Restart the game after changing this option." } },
+    { ELanguage::Japanese, { "フレーム[生成:せいせい]", "LSFG-VKを使用してレンダリングされたフレームの間に中間フレームを1枚生成します。出力は固定2倍で、60 Hzの画面では30 FPSのレンダリングから表示60 FPSを目指します。VSyncは強制的に有効になります。sdmc:/switch/UnleashedRecomp/lsfg/ にLossless.dllが必要です。この設定を変更した後、ゲームを再起動してください。" } },
+    { ELanguage::German,   { "Frame-Generierung", "Erzeugt mit LSFG-VK ein Zwischenbild zwischen gerenderten Bildern. Die Ausgabe ist fest auf 2x eingestellt: Auf einem 60-Hz-Bildschirm werden aus 30 gerenderten FPS bis zu 60 angezeigte FPS. VSync wird erzwungen. Lossless.dll muss sich in sdmc:/switch/UnleashedRecomp/lsfg/ befinden. Starte das Spiel nach einer Änderung neu." } },
+    { ELanguage::French,   { "Génération d'images", "Génère une image intermédiaire entre les images rendues avec LSFG-VK. La sortie est fixée à 2x : sur un écran 60 Hz, 30 FPS rendues visent 60 FPS affichées. La VSync est forcée. Nécessite Lossless.dll dans sdmc:/switch/UnleashedRecomp/lsfg/. Redémarrez le jeu après avoir modifié cette option." } },
+    { ELanguage::Spanish,  { "Generación de fotogramas", "Genera un fotograma intermedio entre los fotogramas renderizados mediante LSFG-VK. La salida es 2x fija: en una pantalla de 60 Hz, 30 FPS renderizados apuntan a 60 FPS mostrados. VSync se fuerza. Requiere Lossless.dll en sdmc:/switch/UnleashedRecomp/lsfg/. Reinicia el juego después de cambiar esta opción." } },
+    { ELanguage::Italian,  { "Generazione fotogrammi", "Genera un fotogramma intermedio tra quelli renderizzati usando LSFG-VK. L'uscita è fissa a 2x: su uno schermo a 60 Hz, 30 FPS renderizzati puntano a 60 FPS visualizzati. VSync viene forzato. Richiede Lossless.dll in sdmc:/switch/UnleashedRecomp/lsfg/. Riavvia il gioco dopo aver modificato questa opzione." } }
+};
+#endif
+
 // Japanese Notes: This localization should include furigana.
 CONFIG_DEFINE_LOCALE(FPS)
 {

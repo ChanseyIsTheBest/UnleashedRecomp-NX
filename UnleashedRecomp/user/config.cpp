@@ -787,6 +787,13 @@ void Config::CreateCallbacks()
     {
         def->Value = std::clamp(def->Value, 0.25f, 2.0f);
     };
+
+#if defined(__SWITCH__)
+    Config::FrameGenerationFlowScale.Callback = [](ConfigDef<float, true>* def)
+    {
+        def->Value = def->Value > 0.375f ? 0.5f : 0.25f;
+    };
+#endif
 }
 
 void Config::Load()

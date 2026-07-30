@@ -29,6 +29,7 @@
 #include <ui/black_bar.h>
 #include <patches/aspect_ratio_patches.h>
 #include <user/config.h>
+#include <user/paths.h>
 #include <sdl_listener.h>
 #include <xxHashMap.h>
 #include <os/process.h>
@@ -120,6 +121,16 @@ namespace plume
 #endif
 
     static std::unique_ptr<RenderInterface> CreateVulkanInterfaceWrapper() {
+#if defined(__SWITCH__)
+        const auto userPath = GetUserPath();
+        SwitchFrameGenerationConfig frameGeneration;
+        frameGeneration.enabled = Config::FrameGeneration;
+        frameGeneration.shaderPath = (userPath / "lsfg" / "Lossless.dll").string();
+        frameGeneration.pipelineCachePath = (userPath / "cache" / "lsfg-vk-pipeline-cache.bin").string();
+        frameGeneration.flowScale = Config::FrameGenerationFlowScale;
+        frameGeneration.performanceMode = Config::FrameGenerationPerformanceMode;
+        ConfigureSwitchFrameGeneration(frameGeneration);
+#endif
 #ifdef SDL_VULKAN_ENABLED
         return CreateVulkanInterface(GameWindow::s_renderWindow);
 #else
@@ -329,7 +340,11 @@ static std::unique_ptr<RenderCommandFence> g_copyCommandFence;
 static std::unique_ptr<RenderSwapChain> g_swapChain;
 static bool g_swapChainValid;
 
+#if defined(__SWITCH__)
+static constexpr RenderFormat BACKBUFFER_FORMAT = RenderFormat::R8G8B8A8_UNORM;
+#else
 static constexpr RenderFormat BACKBUFFER_FORMAT = RenderFormat::B8G8R8A8_UNORM;
+#endif
 
 static std::unique_ptr<RenderCommandSemaphore> g_acquireSemaphores[NUM_FRAMES];
 static std::unique_ptr<RenderCommandSemaphore> g_renderSemaphores[NUM_FRAMES];

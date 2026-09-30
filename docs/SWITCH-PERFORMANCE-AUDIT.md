@@ -10,6 +10,12 @@ console.
 
 Round numbers below are the sections of SWITCH-PERFORMANCE.md (its table maps them to the test-set folders).
 
+The defaults described here are those of the final build (version 0.0.4, "Final build" in SWITCH-PERFORMANCE.md).
+Four round 10 renderer changes are off in it: with them on, long play lost the GPU (see
+[GPU loss with four round 10 renderer changes](#gpu-loss-with-four-round-10-renderer-changes)). The final build also
+sets the output and internal resolution per docked and handheld mode; those are defaults chosen by the user, not
+performance changes (see [Platform modules and diagnostics](#platform-modules-and-diagnostics)).
+
 ## How changes are checked
 
 **On the PC, before a test build:**
@@ -367,6 +373,7 @@ of commands already taken from the queue, and takes more.
   and never past a command the D3D thread may be waiting for (Present, an unlock, ImGui).
 - Risk: a read of the texture that the scan does not see. Textures are read only by draws through texture slots,
   vertex textures included (checked at every draw), and by CPU updates (`UnlockTextureRect`, checked).
+- Off by default in the final build (one of the four changes behind the GPU loss, see below).
 
 ### Clears
 
@@ -374,14 +381,15 @@ of commands already taken from the queue, and takes more.
 command is a draw that provably replaces every pixel of the target (the proof of the exact hand-over), only the edge
 pixels are cleared.
 
-**Clears carried to their pass** (`SwitchCarryClears`, round 10). The waiting clear also waits through commands that
+**Clears carried to their pass** (`SwitchCarryClears`, round 10, off by default in the final build). The waiting clear
+also waits through commands that
 cannot read or write its surface: target changes, depth clears, buffer unlocks and draws into other targets. Its
 pending resolves were already made or handed over by the clear. A new one can only come through a resolve from the
 surface, which makes the clear first. A new clear of the same surface replaces the waiting one, since it overwrites
 every pixel.
 
-**Depth clears** (`SwitchSkipOverwrittenDepthClears`, round 10). A clear of a D32F depth buffer alone (no stencil to
-clear) waits the same way. The next draw into that depth buffer either makes it inside its own pass, or skips it
+**Depth clears** (`SwitchSkipOverwrittenDepthClears`, round 10, off by default in the final build). A clear of a D32F
+depth buffer alone (no stencil to clear) waits the same way. The next draw into that depth buffer either makes it inside its own pass, or skips it
 because the draw writes every depth pixel regardless of the old value. A skip needs:
 - depth test ALWAYS, with depth writes;
 - a position pass-through vertex shader on a proven full-screen quad;
@@ -396,12 +404,12 @@ first.
 resolves moves to the sampling layout in the barrier batch of the change of target. Before, it got a batch of its own
 when first sampled. Only the barrier moves. A depth buffer bound again for depth-test-only draws goes back to an
 attachment with the draw's barrier and keeps its resolves pending: no slot holds its textures, so nothing has
-sampled it.
+sampled it. `SwitchEagerDepthTransitions` (round 10) is off by default in the final build; the colour one stays on.
 
 ### Present
 
-**Present on the render thread** (`SwitchPresentOnRenderThread`, round 10). Present waits only until the render thread
-has recorded the frame. By then the render thread has read everything the game thread sent, including its copies of
+**Present on the render thread** (`SwitchPresentOnRenderThread`, round 10, on by default in the final build). Present
+waits only until the render thread has recorded the frame. By then the render thread has read everything the game thread sent, including its copies of
 constants and vertices. The render thread then, before it processes the next frame's first command:
 1. submits the frame;
 2. presents;
@@ -416,6 +424,48 @@ the recording is done.
   it locks a buffer or texture; commands only queue up meanwhile.
 - The swap-chain resize path runs on the render thread in this mode, between frames, as it did on the main thread.
 - The mode starts only once the game's own D3D thread renders; the installer's frames are unchanged.
+
+### GPU loss with four round 10 renderer changes
+
+**What happened.** Two long sessions with round 10's config 2 lost the GPU:
+- `vkQueueSubmit` returned `VK_ERROR_DEVICE_LOST`, after 21,040 and about 28,000 frames of normal play (15 to 20
+  minutes, heavy scenes at 1080p).
+- Then the game froze. The render thread was inside `vkQueuePresentKHR`, waiting for a sync the lost channel would never
+  signal. The main thread was blocked on the queue mutex, in a copy submission of `D3DXFillTexture`.
+- Nothing faulted on the CPU, so Atmosphère wrote no report. The two reports found on the SD card came from an older
+  build (module id `C10DCEA7...`).
+
+**What it is not.** Config 3 had exactly these four off: `SwitchSkipDeadCopies`, `SwitchCarryClears`,
+`SwitchSkipOverwrittenDepthClears` and `SwitchEagerDepthTransitions`. Everything else was as in config 2: the round 10
+shaders, the present on the render thread, the driver. It played without the loss. That rules out the shaders, the
+pipelined present and the driver changes, each on its own.
+
+Also checked on the PC, and sound:
+- **The four changes' own bookkeeping.**
+  - Dropping a dead copy unlinks the texture and the surface on both sides.
+  - A waiting clear is made before a destruction of its surface and before the end of the frame.
+  - An early transition of a surface destroyed in the same frame is skipped, since its resolves are emptied then.
+  - Carried clears never happened in the logs (0 per frame).
+- **The profilers' query pools.** Bounded at 4,096 draws and 160 passes.
+- **The texture descriptor allocator.** Locked, and the null slots are protected. At most 1,024 descriptors were in use.
+- **The pipelined present's fence and reset order.** Also its swap-chain resize and `WaitForGPU`, which both run
+  between frames.
+- **Mesa's C11 threads.** They are its own, on pthreads, and `mtx_init` returns 0. The sts2 port's lost channels came
+  with an `mtx_init` that reported failure; that does not apply here.
+
+**Suspects.** Two of the four change how depth buffers are cleared and when they leave the attachment layout. The
+driver's ZCULL keeps a plane per depth image:
+- `LOAD_ZCULL` when a pass that loads depth begins;
+- `STORE_ZCULL` when it ends;
+- a zero fill only when the image leaves `UNDEFINED`.
+
+Its own comment says `LOAD_ZCULL` on bad data kills the GPU context. So the depth changes are the first suspects, but
+nothing proves it yet.
+
+**Now.** The four are off by default: 42.4 instead of 44.0 FPS at 1080p. To find the one, turn one on at a time and
+play for 30 minutes or more. If the GPU is lost, `crash.log` now records the driver's reason (see
+[Platform modules and diagnostics](#platform-modules-and-diagnostics)): `notification type 8` is an idle timeout (a
+hang), and the other types are faults.
 
 ## Guest kernel (`kernel/imports.cpp`)
 
@@ -445,6 +495,10 @@ take r13 from the calling context instead of from `g_ppcContext`, which points t
 
 **Relaxed guest atomics** (`SwitchRelaxedAtomics`). `stwcx.`/`stdcx.` become relaxed compare-and-swaps: PowerPC's
 reservation orders no other access. The game's `sync`, `lwsync` and `eieio` stay fences.
+
+`SwitchFastCriticalSections`, `SwitchFastEvents` and `SwitchGuestSpinBeforeSleep` are on by default in the final build.
+The round 10 test builds that were played (configs 2, 3 and 5) had them on. The first-cutscene check stays the test for
+any further guest-kernel change.
 
 ## Guest code replaced by native code (`misc_impl.cpp`, `patches/aspect_ratio_patches.cpp`)
 
@@ -511,6 +565,17 @@ See [SWITCH-MESA.md](SWITCH-MESA.md). These driver-side changes remain:
 Removed in round 7, since the round-4 test set measured no gain from them: the vertex-attribute trimming, the early
 depth test for discarding shaders, and small-target compression. A driver change stays only with a measured gain.
 
+**The driver the final build links** is published as the `unleashedrecomp-driver` branch of
+`ChanseyIsTheBest/mesa-switch`, in three layers:
+1. `0d9d4f08`: mesa-switch with Mesa 26.2.2. The build's local source tree has the same source code; it only lacks
+   files ignored by git and the executable bits.
+2. `acc21efd`: the nfsmw-nx changes, including ZCULL, NAK scheduling and flattening, and the FADD32I fix.
+3. `1e47a108`: the changes above, plus the draw-path and set-4 paths running only for an application that asks.
+
+`nfsmw/mesa-switch-nfsmw-26.2.2.patch` in that branch is its exact diff from `0d9d4f08`, and applies cleanly. The
+branch stays on 26.2.2: moving it to the repository's 26.2.3 needs a new build and test. ZCULL comes from nfsmw-nx; see
+the suspects in [GPU loss](#gpu-loss-with-four-round-10-renderer-changes).
+
 ## Platform modules and diagnostics
 
 - **apm** (`SwitchHandheldGpuBoost`, off). Requests 0x92220008 only in handheld mode, polls the clocks for 1.5 s and
@@ -518,7 +583,9 @@ depth test for discarding shaders, and small-target compression. A driver change
 - **SaltyNX / Status Monitor** (`SwitchOverlayFps`). When the process has no free port session, it may release `sm:`
   for a few milliseconds: not in the first seconds, then at most once a minute. A service opened in that window would
   fail.
-- **stderr** goes to `sdmc:/switch/UnleashedRecomp/stderr.log`, line-buffered.
+- **Logs** (`SwitchLog`, off by default). With it on, stderr goes to `sdmc:/switch/UnleashedRecomp/stderr.log`,
+  line-buffered, and the game's log to `UnleashedRecomp.log`. Otherwise neither file is opened: the logger keeps its
+  first lines in memory until the config is read, then drops them.
 - **Profilers** (all off by default):
   - The pass and draw profilers only add timestamps, plus a flush before each draw timestamp.
   - The CPU sampler pauses each thread for a few microseconds every 2 ms.
@@ -526,7 +593,32 @@ depth test for discarding shaders, and small-target compression. A driver change
     wait on caused the freezes fixed in round 9. The sampler never holds its lock while writing, and the game thread
     only tries that lock.
   - The frame log (`SwitchFrameLog`) formats one frame's text a minute on the render thread.
-- **Stall watchdog** (`SwitchStallWatchSeconds`): a thread at priority 0x1E that only reads.
+- **Stall watchdog** (`SwitchStallWatchSeconds`, 0 = off by default; 1 for tests): a thread at priority 0x1E that only
+  reads. With it off, frames are still counted, for the crash reports.
+- **Crash reports** (`os/switch/crash_switch.cpp`). These are written whatever `SwitchLog` says, appended to
+  `sdmc:/switch/UnleashedRecomp/crash.log`, and each is followed by `svcBreak`, so Atmosphère writes its report too.
+  Once a report has started, nothing takes a lock or allocates: the report is formatted in a static buffer and written
+  through the file system service directly.
+  - A CPU exception goes to the libnx user exception handler, after the battd_nx port's `nx_crash_handler.c`. It writes
+    the thread, fault (pc, lr, far, esr), registers, frame-pointer chain, return addresses found on the stack, and a
+    dump of the stack. The offsets are `[crash] +0x...` lines, which `tools/switch-cpu-profile.py` names.
+  - A lost GPU is reported through plume's callback, on the first `VK_ERROR_DEVICE_LOST` from a submission, fence wait,
+    query read, present or acquire. The report carries the driver's last error messages, among them its
+    `channel N lost: notification={...} error={...}`. A release Mesa gives those only to a `VK_EXT_debug_utils`
+    messenger, so plume now registers one on Switch, for errors only. With a messenger, Mesa formats its rare
+    warnings and errors before filtering them, which costs nothing measurable. This replaced the freeze described
+    above.
+- **Docked and handheld** (display defaults the user chose, not performance changes).
+  - **Window.** 1920x1080 docked, 1280x720 in handheld mode (`GameWindow`). The mode comes from
+    `appletGetDefaultDisplayResolution` and its change event, polled once per frame with no wait. No applet message
+    loop runs, so `appletGetOperationMode()` would keep its first value. A dock set to 720p counts as handheld.
+  - **Switching at run time.** The new size goes to plume (`SetSwitchSwapChainSize`), which rebuilds the swap chain
+    between frames. The NWindow cannot be resized while a swap chain holds buffers, so the WSI retires the old swap
+    chain and sets the new size. The game then remakes its render targets, as after a window resize on the PC. The
+    NWindow crop is off, so the whole buffer is shown at either size.
+  - **Internal resolution.** Kept per mode: `SwitchDockedResolutionScale` 0.8 (1536x864) and
+    `SwitchHandheldResolutionScale` 0.9 (1152x648). The Resolution Scale option shows and changes the current mode's
+    value, and its reset gives that mode's default.
 - Since round 10, the sampler and the watchdog see system calls where Horizon reports a blocked thread: with its PC at
   the SVC instruction. They had only looked right after it, so no wait had been attributed before.
 
@@ -540,10 +632,15 @@ depth test for discarding shaders, and small-target compression. A driver change
 - plume never invalidates read-back memory before the CPU reads it (as upstream; nothing is read back during play).
 - The quad sinking variant is slower on this driver than the per-pixel one (0.57 ms at 1080p), so it is off by
   default.
+- The four round 10 renderer changes above are off: one or more of them loses the GPU in long play, and which one is
+  not known yet.
+- Switching between docked and handheld while the game runs is new in the final build, and has not been tested on
+  the console yet.
 
 ## Checklist for a new build on the console
 
-1. The first line of `stderr.log` names the build, and the "Switch round" lines show which switches are on.
+1. With `SwitchLog = true`: the first line of `stderr.log` names the build, and the "Switch round" lines show which
+   switches are on. The final build writes no log without it.
 2. After a translator change: one session each with `SwitchVerifyShadowGather = true` and
    `SwitchVerifyTextureSizes = true` (menus, a day stage, a night stage, a hub). No magenta.
 3. After a change to the LZX decoder: one session with `SwitchVerifyNativeDecompress = true`. Every `[lzx]` line says
@@ -551,3 +648,6 @@ depth test for discarding shaders, and small-target compression. A driver change
 4. After a guest-kernel change: play into a stage until its first in-game cutscene. The audio must keep going during
    and after it.
 5. A/B the new switches with the test-set method in SWITCH-PERFORMANCE.md.
+6. Dock and undock during a stage. The picture follows at 1080p or 720p, and Resolution Scale shows that mode's value.
+7. If the game closes with an error, read `sdmc:/switch/UnleashedRecomp/crash.log`, and name its offsets with
+   `tools/switch-cpu-profile.py crash.log --elf <that build's ELF>`.

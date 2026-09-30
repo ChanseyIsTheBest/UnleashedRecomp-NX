@@ -556,25 +556,164 @@ safe. After linking, the build checks the ELF: every hook symbol is present, and
 
 ## Driver (Mesa/NVK)
 
-See [SWITCH-MESA.md](SWITCH-MESA.md). These driver-side changes remain:
-- dropping unread varyings when a pipeline is linked (`SwitchLinkVaryings`), and every varying of a pipeline without a
-  fragment shader;
-- NAK operand reuse;
-- the ZCULL direction (`SwitchZcullGreater`).
+The game links NVK statically. The driver it is built with has two layers of Switch changes on top of mesa-switch
+(Mesa 26.2.2 with the Horizon backend):
+- **base:** the Switch driver changes made before this port;
+- **this port:** UnleashedRecomp's own changes.
 
-Removed in round 7, since the round-4 test set measured no gain from them: the vertex-attribute trimming, the early
-depth test for discarding shaders, and small-target compression. A driver change stays only with a measured gain.
+Driver changes are held to the same rule as the game's, with one difference: some rest on how the hardware behaves,
+which the code cannot prove. Those are marked below, with what was seen on the console. The game sets driver switches
+before the Vulkan instance is created: two have `[Switch]` keys (`SwitchZcullGreater`, `SwitchLinkVaryings`), and any
+other goes through `SwitchMesaEnvironment = "NAME=value;NAME=value"`. [SWITCH-MESA.md](SWITCH-MESA.md) covers the build.
 
-**The driver the final build links** is published as the `unleashedrecomp-driver` branch of
-`ChanseyIsTheBest/mesa-switch`, in three layers:
-1. `0d9d4f08`: mesa-switch with Mesa 26.2.2. The build's local source tree has the same source code; it only lacks
-   files ignored by git and the executable bits.
-2. `acc21efd`: the nfsmw-nx changes, including ZCULL, NAK scheduling and flattening, and the FADD32I fix.
-3. `1e47a108`: the changes above, plus the draw-path and set-4 paths running only for an application that asks.
+| Change | Layer | Default here | Turned off by | The image holds because |
+|---|---|---|---|---|
+| Operand reuse | this port | on | `NAK_DEBUG=noreuse` | hardware rules; identical on the console |
+| Scheduler latencies | both | 200 cycles | `NAK_TEX_LATENCY`, `NAK_MEM_LATENCY`, `NAK_ATTR_LATENCY` | only the order changes |
+| Branch flattening | base | on | — | the same values are selected |
+| FADD32I saturation | base | on | — | a correctness fix |
+| Unread varyings dropped at link | this port | on | `SwitchLinkVaryings = false` | the fragment shader reads the same values |
+| Varyings of pipelines without a fragment shader | this port | on | `NVK_SWITCH_VS_ONLY_VARYINGS=0` | nothing reads them |
+| Colour writes to missing attachments dropped | base | on | — | Vulkan discards them |
+| ZCULL | base | on | `NVK_ZCULL=off` | hardware, with planes that match the depth buffer |
+| ZCULL direction `greater` | this port | on | `SwitchZcullGreater = false` | hardware; nothing missing seen |
+| Draw-path fast paths, set 4 by differences | base (opt-in: this port) | not run | — | not used by this game |
+| Buffer copies on the copy engine | base | off | — | not used |
+| Subtiling split | base | unchanged | `NVK_SUBTILING_KNOB` | not changed |
 
-`nfsmw/mesa-switch-nfsmw-26.2.2.patch` in that branch is its exact diff from `0d9d4f08`, and applies cleanly. The
-branch stays on 26.2.2: moving it to the repository's 26.2.3 needs a new build and test. ZCULL comes from nfsmw-nx; see
-the suspects in [GPU loss](#gpu-loss-with-four-round-10-renderer-changes).
+### Shader compiler (NAK)
+
+**Operand reuse** (this port). Maxwell's control bits can ask the operand collector to keep the value an instruction read
+in slot A, B or C for the next instruction. That instruction then takes the operand from the reuse cache instead of the
+register file, which avoids register-bank conflicts. The flag is set only between two neighbouring instructions of one
+basic block, so the second is never a branch target, and only when:
+- both are unpredicated FADD, FMUL, FFMA, FMNMX, FSET, FSETP or SEL (`NAK_DEBUG=reusebasic` limits it to the first
+  three), and the first does not yield;
+- the same single GPR sits in the same operand slot in both, exactly where the encoder puts it (for FFMA with its third
+  source in the constant buffer, the second source moves to slot C);
+- the first does not write that register (the cached value is not invalidated by a write);
+- the second waits on no scoreboard, so no variable-latency result can land in between.
+
+The instructions compute the same thing; only where an operand is read from changes.
+- **Rests on hardware behaviour.** NVIDIA documents none of this, and the rules above are inferred. On the console the
+  images matched with and without it, and the GPU frame at the hub went from 22.63 to 22.49 ms.
+- **Risk.** A hardware rule the conditions miss would give wrong values in the affected instructions, visible as a
+  rendering difference; `NAK_DEBUG=noreuse` isolates it. The setting is part of the shader cache key, so binaries with
+  and without it never mix.
+
+**Scheduler latencies.**
+- Base: the texture and memory latencies go from 32 to 200 cycles.
+- This port: attribute access is split from memory, and all three are settable with `NAK_TEX_LATENCY`,
+  `NAK_MEM_LATENCY` and `NAK_ATTR_LATENCY` (1 to 1000, default 200).
+
+These are the scheduler's estimates, used only to order instructions. The waits that make results correct (scoreboard
+barriers and stall counts) are computed separately, from the hardware's latencies. So every value stays the same;
+only the order and the register pressure change. The values are part of the shader cache key.
+
+**Branch flattening** (base: NIR `peephole_select` limit 0 → 8). A small `if`/`else` becomes both sides computed plus a
+select. NIR flattens only instructions without side effects (no stores, discards or barriers), and the select takes
+the value the branch would have produced. Flattening can raise register pressure: a spill to local memory would cost
+time, not correctness, and `NVK_SHADER_STATS=1` shows it.
+
+**FADD32I saturation** (base). On SM50, FADD32I (the long-immediate form) has no saturation bit, so `fsat(a + imm)` lost
+its clamp when encoded that way. Such adds are no longer encoded that way. This changes the output compared with a
+compiler without the fix, towards what the shader says: it is a correctness fix, not a performance change.
+
+**Cache keys.** NAK revision 4, the link flag and the scheduler latency key are part of the shader cache key and the
+pipeline cache UUID. A driver change or a change of settings never reuses a binary compiled differently.
+
+### Pipeline linking (NVK)
+
+**Unread varyings** (this port; `SwitchLinkVaryings`, `NVK_LINK_VARYINGS`). When a pipeline has both stages, the
+components of the generic outputs its fragment shader never reads are removed from the last pre-rasterization shader.
+Dead-code elimination then removes the math and vertex fetches that only fed them.
+- **What it touches.** Only generic 32-bit scalar or vector varyings, and nothing with transform feedback. Position,
+  clip and cull distances, point size, layer and viewport are never touched.
+- **What counts as unread.** A component is unread only if every use of its input variable is a direct load and none
+  of them reads it. Any other access (an array index, `interpolateAt`, a copy) keeps the whole input, and so does any
+  input that is not a 32-bit scalar or vector.
+- **Why the image holds.** The fragment shader reads exactly the values it read before. The renderer trims the
+  translated shaders the same way on its side (`SwitchTrimVertexOutputs`); this covers the pipelines it does not.
+
+**Pipelines without a fragment shader** (this port; `NVK_SWITCH_VS_ONLY_VARYINGS`). Depth-only pipelines drop every
+generic output of the vertex shader, since nothing reads them. It applies only when the pipeline state says there is
+no fragment shader at all; a pipeline library that gets its fragment shader later is left alone.
+
+**Colour writes to missing attachments** (base). Fragment-shader writes to colour attachments the pipeline does not
+have are removed, along with what only fed them; Vulkan discards such writes. Writes that go to every target and the
+second blend source stay, and the attachment mask is part of the pipeline key.
+
+### ZCULL
+
+**ZCULL on Horizon** (base). Hierarchical depth culling: the 3D engine keeps a coarse depth range per screen tile and
+rejects fragments that fail the depth test for a whole tile, before they are shaded.
+- **Setup.** The driver uses the kernel's ZCULL geometry, binds a ZCULL context buffer to each 3D channel, and gives
+  each eligible depth image a plane (its saved ZCULL data).
+  - Eligible means a depth attachment whose only other uses are read-only, with optimal tiling, and not 3D or sparse.
+  - The renderer creates its depth targets without `TRANSFER_DST` for this (the plume patch).
+- **At each pass with such a depth buffer.**
+  - When the pass begins: `LOAD_ZCULL` if depth is loaded, `CLEAR_ZCULL_REGION` if it is cleared or discarded.
+  - When it ends: `STORE_ZCULL` if depth is stored.
+  - A layout change from `UNDEFINED` fills the plane with zeros first.
+- **Rests on hardware behaviour.** ZCULL rejects only fragments the depth test would reject, as long as the plane
+  describes the depth buffer. The driver does not update the plane in two cases:
+  - writes outside depth passes, hence the eligibility rule;
+  - depth clears made inside a pass with `vkCmdClearAttachments` (a TODO in the driver), which is how the renderer
+    clears. Those rely on the 3D engine's own clear keeping ZCULL right.
+- **Seen on the console.** No missing pixels, but little gain either: `NVK_ZCULL=off` changed no pass at the hub.
+- **Risk.** The driver's own comment says `LOAD_ZCULL` on bad plane data kills the GPU context. That makes ZCULL the
+  first suspect in the [GPU loss](#gpu-loss-with-four-round-10-renderer-changes), together with two of the round 10
+  depth changes.
+
+**ZCULL direction** (this port; `SwitchZcullGreater`, `NVK_ZCULL=less|greater|off`). The driver used `ZDIR_LESS` for
+every depth target, as NVIDIA's driver does, but the game's main pass tests depth `GREATER` (reverse Z).
+- `greater` uses `ZDIR_GREATER` for every target; `off` never enables ZCULL.
+- One direction holds for the whole run, so a plane is always loaded with the direction it was stored with.
+- **Rests on hardware behaviour.** Passes that test the other way (the shadow maps) are expected to lose the culling,
+  not to cull wrongly. On the console nothing was missing in either kind of pass, and `greater` gave −0.17 ms, mostly
+  in the half-resolution pass with depth.
+
+### Not used by this game
+
+- **Draw-path fast paths and set 4 by differences** (base; opt-in since this port).
+  - The fast paths: cheaper draw emission, fewer constant-buffer rebinds, dynamic-state shortcuts and pipeline
+    prefetch. Set 4 by differences writes dynamic uniform buffers to the root table by differences. Each has a
+    self-check that turns it off on a mismatch.
+  - They run only for an application that asks through the driver's shared structures (`pedido > 0`). UnleashedRecomp
+    asks only with `SwitchNvkFastPaths = true`, which is off by default; the log line `NVK fast paths: off (...)`
+    confirms it.
+- **Buffer copies on the copy engine** (base). Off unless `NVK_COPY_ENGINE=1`.
+- **Subtiling** (base). `NVK_SUBTILING_KNOB` can override the fragment subtiling split. Without it, the value is the
+  one the driver always used on the T210.
+
+### Removed
+
+Removed in round 7, because the round-4 test set measured no gain from them:
+- the vertex-attribute trimming (`NVK_SWITCH_VI_READ_ONLY`);
+- the early depth test for discarding shaders (`NVK_SWITCH_EARLY_Z_KILL`);
+- small-target compression (`NVK_SWITCH_COMPRESS_MIN_KB`).
+
+A driver change stays only with a measured gain.
+
+### Build and diagnostics (no effect on output)
+
+- `build-unified.sh` can rebuild incrementally (`MESA_SWITCH_INCREMENTAL=1`), and retries ninja once when parallel
+  bindgen steps collide on Windows.
+- `NVK_SHADER_STATS=1` prints, for each compiled shader, its registers, local memory, occupancy, size, instructions,
+  static cycles and spills. Each line is keyed by the start of the BLAKE3 of its SPIR-V, which the draw profiler prints
+  too.
+
+### Where the driver is
+
+The driver the final build links is published as the `unleashedrecomp-driver` branch of `ChanseyIsTheBest/mesa-switch`,
+in three layers:
+1. `0d9d4f08`: mesa-switch with Mesa 26.2.2. The build's local source tree has the same source code; it lacks only files
+   ignored by git and the executable bits.
+2. `acc21efd`: the base changes above, described in the branch's `nfsmw/README.md`.
+3. `1e47a108`: this port's changes above.
+
+The patch file in that `nfsmw/` folder is the branch's exact diff from `0d9d4f08`, and it applies cleanly. The branch
+stays on 26.2.2: moving it to the repository's 26.2.3 needs a new build and test.
 
 ## Platform modules and diagnostics
 

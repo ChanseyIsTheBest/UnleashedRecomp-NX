@@ -2,6 +2,7 @@
 #include <hid/hid.h>
 #include <kernel/xdm.h>
 #include <os/logger.h>
+#include <user/config.h>
 
 #include <algorithm>
 #include <cstring>
@@ -17,6 +18,10 @@ namespace
     HidNpadStyleTag g_vibrationStyle = static_cast<HidNpadStyleTag>(0);
     int g_vibrationHandleCount = 0;
     bool g_vibrationInitialized = false;
+    // Round 13, SwitchVibrationDedupe: the game sets the motors every frame, nearly always to 0, and each stop was an
+    // IPC to the HID service. A stop is now sent once and not again until something else was sent (stopped motors stay
+    // stopped). Any speed other than 0 is sent every time, as before, and new vibration devices get a stop again.
+    bool g_vibrationStopped = false;
 
     int16_t ScaleStickAxis(s32 value)
     {
@@ -111,6 +116,7 @@ namespace
         g_vibrationStyle = style;
         g_vibrationHandleCount = handleCount;
         g_vibrationInitialized = true;
+        g_vibrationStopped = false;
         return true;
     }
 
@@ -160,6 +166,9 @@ namespace
         if (!g_vibrationInitialized)
             return;
 
+        if (g_vibrationStopped && Config::SwitchVibrationDedupe)
+            return;
+
         HidVibrationValue values[2]{};
         for (int i = 0; i < g_vibrationHandleCount; i++)
         {
@@ -168,6 +177,7 @@ namespace
         }
 
         hidSendVibrationValues(g_vibrationHandles, values, g_vibrationHandleCount);
+        g_vibrationStopped = true;
     }
 }
 
@@ -238,6 +248,7 @@ uint32_t hid::SetState(uint32_t dwUserIndex, XAMINPUT_VIBRATION* pVibration)
     }
 
     hidSendVibrationValues(g_vibrationHandles, values, g_vibrationHandleCount);
+    g_vibrationStopped = false;
     return ERROR_SUCCESS;
 }
 

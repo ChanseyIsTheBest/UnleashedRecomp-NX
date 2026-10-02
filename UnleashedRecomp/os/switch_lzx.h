@@ -18,4 +18,8 @@ namespace os::switch_lzx
     // sizes it does not handle), possibly after writing part of the output: the caller then runs the guest's
     // decoder, which starts over from the same input and writes the destination again.
     bool Decompress(const uint8_t* source, uint32_t sourceSize, uint32_t windowSize, uint8_t* destination, uint32_t& decodedSize);
+
+    // SwitchFastNativeDecompress: the same decoder with its bit reader in locals and matches copied 8 bytes at a
+    // time (the same output, decisions and errors). Set before any decompression.
+    void SetFastDecoder(bool fast);
 }

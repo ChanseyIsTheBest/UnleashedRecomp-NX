@@ -7,12 +7,152 @@
 #include <os/logger.h>
 #include <user/config.h>
 #include <stdafx.h>
+#if defined(__SWITCH__)
+#include <user/paths.h>
+#include <switch.h>
+#include <climits>
+#endif
 
 struct FileHandle : KernelObject
 {
     std::fstream stream;
     std::filesystem::path path;
+#if defined(__SWITCH__)
+    bool readOnly = false;
+#endif
 };
+
+#if defined(__SWITCH__)
+// [Switch] Round 11. Each std::filesystem query of a path on the SD card is several IPCs to the file system
+// service: a stat is 5 (entry type, open, size, close, timestamps) plus 3 time zone conversions.
+
+// SwitchNativeFindFile: whether the directory lies in the game's own content (game, update, dlc), which nothing
+// writes while it runs; the save and user folders keep the std path (a file open for writing stats differently).
+static bool IsGameContentDirectory(const std::string& directory)
+{
+    for (const char* root : { "game", "update", "dlc" })
+    {
+        const std::string rootPath = (const char*)(GetGamePath() / root).u8string().c_str();
+        if (directory.size() >= rootPath.size() && directory.compare(0, rootPath.size(), rootPath) == 0 &&
+            (directory.size() == rootPath.size() || directory[rootPath.size()] == '/'))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// SwitchNativeFindFile: the entries of a directory from the directory reads alone, where std::filesystem stats every
+// file for its size. The same entries in the same order (the service's), the same names (an ASCII name is copied
+// as it is by fsdev_dirnext too), the same sizes (the entry's size is the file's). Anything else (a directory that
+// cannot be read, an entry that is neither a file nor a directory, a name the std path would convert or refuse)
+// leaves the directory to the std path, which then does exactly what it did.
+static bool AddDirectoryNative(const std::filesystem::path& directory,
+    ankerl::unordered_dense::map<std::u8string, std::pair<size_t, bool>>& searchResult)
+{
+    const std::string path = (const char*)directory.u8string().c_str();
+    if (!IsGameContentDirectory(path))
+        return false;
+
+    FsFileSystem* fileSystem = nullptr;
+    char fsPath[FS_MAX_PATH];
+    if (fsdevTranslatePath(path.c_str(), &fileSystem, fsPath) == -1)
+        return false;
+
+    FsDir dir;
+    if (R_FAILED(fsFsOpenDirectory(fileSystem, fsPath, FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &dir)))
+        return false;
+
+    std::vector<FsDirectoryEntry> entries(64);
+    std::vector<std::pair<std::u8string, std::pair<size_t, bool>>> found;
+    bool usable = true;
+    while (usable)
+    {
+        s64 count = 0;
+        if (R_FAILED(fsDirRead(&dir, &count, entries.size(), entries.data())))
+        {
+            usable = false;
+            break;
+        }
+
+        if (count == 0)
+            break;
+
+        for (s64 i = 0; i < count && usable; i++)
+        {
+            const FsDirectoryEntry& entry = entries[i];
+            const size_t length = strnlen(entry.name, sizeof(entry.name));
+            usable = (entry.type == FsDirEntryType_Dir || entry.type == FsDirEntryType_File) && length != 0 && length < NAME_MAX;
+            for (size_t k = 0; k < length && usable; k++)
+                usable = uint8_t(entry.name[k]) < 0x80;
+
+            if (usable)
+            {
+                const bool isDirectory = entry.type == FsDirEntryType_Dir;
+                const std::u8string relativePath =
+                    (directory / std::u8string_view((const char8_t*)entry.name, length)).lexically_relative(directory).u8string();
+                found.emplace_back(relativePath, std::make_pair(isDirectory ? size_t(0) : size_t(entry.file_size), isDirectory));
+            }
+        }
+    }
+
+    fsDirClose(&dir);
+    if (!usable)
+        return false;
+
+    for (auto& [relativePath, value] : found)
+        searchResult.emplace(std::move(relativePath), value);
+
+    return true;
+}
+
+// SwitchNativeFileHandles: a read-only file's size from its open handle (one IPC) instead of a stat of its path. The
+// file stream's own buffer seeks to the end and back, which leaves the stream's state (fail, eof) as it was and
+// only makes it read its next bytes again from the file.
+static bool NativeFileSize(FileHandle* hFile, uint64_t& size)
+{
+    if (!Config::SwitchNativeFileHandles || !hFile->readOnly)
+        return false;
+
+    std::filebuf* buffer = hFile->stream.rdbuf();
+    const std::streampos invalid = std::streampos(std::streamoff(-1));
+    const std::streampos position = buffer->pubseekoff(0, std::ios::cur, std::ios::in);
+    if (position == invalid)
+        return false;
+
+    const std::streampos end = buffer->pubseekoff(0, std::ios::end, std::ios::in);
+    const std::streampos back = buffer->pubseekpos(position, std::ios::in);
+    if (end == invalid || back != position)
+        return false;
+
+    size = uint64_t(std::streamoff(end));
+    return true;
+}
+
+// SwitchNativeFileHandles: whether a path exists, from its entry type (one IPC) instead of a stat. Anything but
+// "found" or "not found" asks std::filesystem.
+static bool PathExists(const std::string& path)
+{
+    std::error_code ec;
+    if (!Config::SwitchNativeFileHandles)
+        return std::filesystem::exists(path, ec);
+
+    FsFileSystem* fileSystem = nullptr;
+    char fsPath[FS_MAX_PATH];
+    if (fsdevTranslatePath(path.c_str(), &fileSystem, fsPath) == -1)
+        return std::filesystem::exists(path, ec);
+
+    FsDirEntryType type;
+    const Result result = fsFsGetEntryType(fileSystem, fsPath, &type);
+    if (R_SUCCEEDED(result))
+        return true;
+    if (R_MODULE(result) == 2 && R_DESCRIPTION(result) == 1) // fs: path not found (2-0001)
+        return false;
+
+    return std::filesystem::exists(path, ec);
+}
+#endif
 
 struct FindHandle : KernelObject
 {
@@ -24,6 +164,10 @@ struct FindHandle : KernelObject
     {
         auto addDirectory = [&](const std::filesystem::path& directory)
             {
+#if defined(__SWITCH__)
+                if (Config::SwitchNativeFindFile && AddDirectoryNative(directory, searchResult))
+                    return;
+#endif
                 for (auto& entry : std::filesystem::directory_iterator(directory, ec))
                 {
                     std::u8string relativePath = entry.path().lexically_relative(directory).u8string();
@@ -118,13 +262,21 @@ FileHandle* XCreateFileA
     FileHandle *fileHandle = CreateKernelObject<FileHandle>();
     fileHandle->stream = std::move(fileStream);
     fileHandle->path = std::move(filePath);
+#if defined(__SWITCH__)
+    fileHandle->readOnly = (dwDesiredAccess & GENERIC_WRITE) == 0;
+#endif
     return fileHandle;
 }
 
 static uint32_t XGetFileSizeA(FileHandle* hFile, be<uint32_t>* lpFileSizeHigh)
 {
     std::error_code ec;
+#if defined(__SWITCH__)
+    uint64_t nativeSize;
+    auto fileSize = NativeFileSize(hFile, nativeSize) ? nativeSize : std::filesystem::file_size(hFile->path, ec);
+#else
     auto fileSize = std::filesystem::file_size(hFile->path, ec);
+#endif
     if (!ec)
     {
         if (lpFileSizeHigh != nullptr)
@@ -141,7 +293,12 @@ static uint32_t XGetFileSizeA(FileHandle* hFile, be<uint32_t>* lpFileSizeHigh)
 uint32_t XGetFileSizeExA(FileHandle* hFile, LARGE_INTEGER* lpFileSize)
 {
     std::error_code ec;
+#if defined(__SWITCH__)
+    uint64_t nativeSize;
+    auto fileSize = NativeFileSize(hFile, nativeSize) ? nativeSize : std::filesystem::file_size(hFile->path, ec);
+#else
     auto fileSize = std::filesystem::file_size(hFile->path, ec);
+#endif
     if (!ec)
     {
         if (lpFileSize != nullptr)
@@ -400,9 +557,14 @@ std::filesystem::path FileSystem::ResolvePath(const std::string_view& path, bool
                 updatePath += pathNoRoot;
                 std::replace(updatePath.begin(), updatePath.end(), '\\', '/');
 
+#if defined(__SWITCH__)
+                if (PathExists(updatePath))
+                    root = "update";
+#else
                 std::error_code ec;
                 if (std::filesystem::exists(updatePath, ec))
                     root = "update";
+#endif
             }
         }
 

@@ -1,8 +1,8 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..f3b15cd 100644
+index fa91527..ca69609 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
-@@ -14,6 +14,15 @@ bool Recompiler::LoadConfig(const std::string_view& configFilePath)
+@@ -14,6 +14,35 @@ bool Recompiler::LoadConfig(const std::string_view& configFilePath)
  {
      config.Load(configFilePath);
  
@@ -15,10 +15,30 @@ index fa91527..f3b15cd 100644
 +        fmt::println("XENON_RECOMP_CLASSIC=1: no loop barriers, callee-saved stores kept, CSR state unknown at labels");
 +    }
 +
++    // [Switch] Round 15 (see recompiler.h).
++    if (const char* fma = std::getenv("XENON_RECOMP_EXPLICIT_FMA"); fma != nullptr && fma[0] == '1')
++    {
++        explicitFma = true;
++        fmt::println("XENON_RECOMP_EXPLICIT_FMA=1: the guest's fused multiply-adds as explicit fused operations");
++    }
++    if (const char* rsqrt = std::getenv("XENON_RECOMP_SCALAR_RSQRT"); rsqrt != nullptr && rsqrt[0] == '1')
++    {
++        scalarRsqrt = true;
++        fmt::println("XENON_RECOMP_SCALAR_RSQRT=1: vrsqrtefp/vrefp of a dot product as one scalar operation");
++    }
++
++    // [Switch] Round 14 (see recompiler.h).
++    if (const char* fewer = std::getenv("XENON_RECOMP_FEWER_MODE_SWITCHES"); fewer != nullptr && (fewer[0] == '1' || fewer[0] == '2'))
++    {
++        fewerModeSwitches = fewer[0] - '0';
++        fmt::println("XENON_RECOMP_FEWER_MODE_SWITCHES={}: instructions whose result does not depend on the flush mode keep "
++            "the known one{}", fewerModeSwitches, fewerModeSwitches >= 2 ? ", and the moves and conversions an unknown one" : "");
++    }
++
      std::vector<uint8_t> file;
      if (!config.patchedFilePath.empty())
          file = LoadFile((config.directoryPath + config.patchedFilePath).c_str());
-@@ -404,6 +413,17 @@ bool Recompiler::Recompile(
+@@ -404,6 +433,17 @@ bool Recompiler::Recompile(
              }
          };
  
@@ -36,7 +56,7 @@ index fa91527..f3b15cd 100644
      auto printConditionalBranch = [&](bool not_, const std::string_view& cond)
          {
              if (insn.operands[1] < fn.base || insn.operands[1] >= fn.base + fn.size)
-@@ -416,7 +436,7 @@ bool Recompiler::Recompile(
+@@ -416,7 +456,7 @@ bool Recompiler::Recompile(
              }
              else
              {
@@ -45,7 +65,46 @@ index fa91527..f3b15cd 100644
              }
          };
  
-@@ -487,10 +507,14 @@ bool Recompiler::Recompile(
+@@ -433,8 +473,38 @@ bool Recompiler::Recompile(
+             }
+         };
+ 
++    // [Switch] Round 14, fewerModeSwitches: true when the instruction can run in the VMX flush mode, which is then kept.
++    auto keepsVmxMode = [&]()
++        {
++            return fewerModeSwitches >= 1 && csrState == CSRState::VMX;
++        };
++
++    // Level 2: an unknown mode is left unknown by the instructions below.
++    auto keepsUnknownMode = [&]()
++        {
++            return fewerModeSwitches >= 2 && csrState == CSRState::Unknown;
++        };
++
++    // An instruction whose result is the same in either mode: it sets the FPU mode only where it always did.
++    auto printSetFlushModeUnlessVmx = [&]()
++        {
++            if (!keepsVmxMode() && !keepsUnknownMode())
++                printSetFlushMode(false);
++        };
++
++    // The same for a vector instruction in the FPU mode: it sets the VMX mode only where it always did.
++    auto printSetFlushModeUnlessFpu = [&]()
++        {
++            if (!(fewerModeSwitches >= 1 && csrState == CSRState::FPU) && !keepsUnknownMode())
++                printSetFlushMode(true);
++        };
++
+     auto midAsmHook = config.midAsmHooks.find(base);
+ 
++    // [Switch] Round 15, scalarRsqrt: a mid-asm hook may change any register.
++    if (midAsmHook != config.midAsmHooks.end())
++        vectorDotProduct.fill(false);
++
+     auto printMidAsmHook = [&]()
+         {
+             bool returnsBool = midAsmHook->second.returnOnFalse || midAsmHook->second.returnOnTrue ||
+@@ -487,10 +557,14 @@ bool Recompiler::Recompile(
              {
                  println(")) {{");
  
@@ -61,7 +120,7 @@ index fa91527..f3b15cd 100644
  
                  println("\t}}");
  
-@@ -499,7 +523,7 @@ bool Recompiler::Recompile(
+@@ -499,7 +573,7 @@ bool Recompiler::Recompile(
                  if (midAsmHook->second.returnOnFalse)
                      println("\t\treturn;");
                  else if (midAsmHook->second.jumpAddressOnFalse != NULL)
@@ -70,7 +129,7 @@ index fa91527..f3b15cd 100644
  
                  println("\t}}");
              }
-@@ -507,10 +531,13 @@ bool Recompiler::Recompile(
+@@ -507,10 +581,13 @@ bool Recompiler::Recompile(
              {
                  println(");");
  
@@ -85,7 +144,7 @@ index fa91527..f3b15cd 100644
              }
          };
  
-@@ -602,13 +629,25 @@ bool Recompiler::Recompile(
+@@ -602,13 +679,25 @@ bool Recompiler::Recompile(
          }
          else
          {
@@ -112,7 +171,7 @@ index fa91527..f3b15cd 100644
              println("\tswitch ({}.u64) {{", r(switchTable->second.r));
  
              for (size_t i = 0; i < switchTable->second.labels.size(); i++)
-@@ -618,11 +657,13 @@ bool Recompiler::Recompile(
+@@ -618,11 +707,13 @@ bool Recompiler::Recompile(
                  if (label < fn.base || label >= fn.base + fn.size)
                  {
                      println("\t\t// ERROR: 0x{:X}", label);
@@ -127,7 +186,7 @@ index fa91527..f3b15cd 100644
                      println("\t\tgoto loc_{:X};", label);
                  }
              }
-@@ -649,7 +690,7 @@ bool Recompiler::Recompile(
+@@ -649,7 +740,7 @@ bool Recompiler::Recompile(
  
      case PPC_INST_BDZ:
          println("\t--{}.u64;", ctr());
@@ -136,7 +195,7 @@ index fa91527..f3b15cd 100644
          break;
  
      case PPC_INST_BDZLR:
-@@ -659,13 +700,13 @@ bool Recompiler::Recompile(
+@@ -659,13 +750,13 @@ bool Recompiler::Recompile(
  
      case PPC_INST_BDNZ:
          println("\t--{}.u64;", ctr());
@@ -152,7 +211,25 @@ index fa91527..f3b15cd 100644
          break;
  
      case PPC_INST_BEQ:
-@@ -849,7 +890,8 @@ bool Recompiler::Recompile(
+@@ -805,11 +896,13 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_DCBT:
+-        // no op
+-        break;
+-
+     case PPC_INST_DCBTST:
+-        // no op
++        // [Switch] Round 13: a host prefetch of the same address (PPC_PREFETCH, ppc_context.h); it changes nothing else.
++        // The operands are CT (the touch hint), RA (0: none) and RB.
++        print("\t{}(", id == PPC_INST_DCBT ? "PPC_PREFETCH" : "PPC_PREFETCH_STORE");
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32);", r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_DCBZ:
+@@ -849,7 +942,8 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_EIEIO:
@@ -162,7 +239,210 @@ index fa91527..f3b15cd 100644
          break;
  
      case PPC_INST_EXTSB:
-@@ -1209,7 +1251,7 @@ bool Recompiler::Recompile(
+@@ -871,7 +965,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FABS:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.u64 = {}.u64 & ~0x8000000000000000;", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+@@ -886,11 +980,17 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FCFID:
+-        printSetFlushMode(false);
++        // An integer converted to double is 0 or at least 1 in magnitude: never a denormal.
++        printSetFlushModeUnlessVmx();
+         println("\t{}.f64 = double({}.s64);", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FCMPU:
++        if (keepsVmxMode())
++        {
++            println("\t{}.compareBits({}.u64, {}.u64);", cr(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]));
++            break;
++        }
+         printSetFlushMode(false);
+         println("\t{}.compare({}.f64, {}.f64);", cr(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]));
+         break;
+@@ -901,12 +1001,13 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FCTIDZ:
+-        printSetFlushMode(false);
++        // Truncation: a denormal gives 0 whether or not FZ makes it a zero first.
++        printSetFlushModeUnlessVmx();
+         println("\t{}.s64 = ({}.f64 > double(LLONG_MAX)) ? LLONG_MAX : simde_mm_cvttsd_si64(simde_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FCTIWZ:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.s64 = ({}.f64 > double(INT_MAX)) ? INT_MAX : simde_mm_cvttsd_si32(simde_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
+         break;
+ 
+@@ -922,27 +1023,39 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_FMADD:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = {}.f64 * {}.f64 + {}.f64;", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = __builtin_fma({}.f64, {}.f64, {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = {}.f64 * {}.f64 + {}.f64;", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FMADDS:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = double(float({}.f64 * {}.f64 + {}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = double(float(__builtin_fma({}.f64, {}.f64, {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = double(float({}.f64 * {}.f64 + {}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FMR:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.f64 = {}.f64;", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FMSUB:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = {}.f64 * {}.f64 - {}.f64;", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = __builtin_fma({}.f64, {}.f64, -{}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = {}.f64 * {}.f64 - {}.f64;", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FMSUBS:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = double(float({}.f64 * {}.f64 - {}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = double(float(__builtin_fma({}.f64, {}.f64, -{}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = double(float({}.f64 * {}.f64 - {}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FMUL:
+@@ -956,28 +1069,37 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FNABS:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.u64 = {}.u64 | 0x8000000000000000;", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FNEG:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         println("\t{}.u64 = {}.u64 ^ 0x8000000000000000;", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_FNMADDS:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = double(float(-({}.f64 * {}.f64 + {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = double(float(-__builtin_fma({}.f64, {}.f64, {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = double(float(-({}.f64 * {}.f64 + {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FNMSUB:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = -({}.f64 * {}.f64 - {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = -__builtin_fma({}.f64, {}.f64, -{}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = -({}.f64 * {}.f64 - {}.f64);", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FNMSUBS:
+         printSetFlushMode(false);
+-        println("\t{}.f64 = double(float(-({}.f64 * {}.f64 - {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        if (explicitFma)
++            println("\t{}.f64 = double(float(-__builtin_fma({}.f64, {}.f64, -{}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
++        else
++            println("\t{}.f64 = double(float(-({}.f64 * {}.f64 - {}.f64)));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]), f(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_FRES:
+@@ -986,6 +1108,11 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_FRSP:
++        if (keepsVmxMode())
++        {
++            println("\t{}.f64 = PPCFloatToDoubleAnyMode(PPCDoubleToFloatBitsAnyMode({}.u64, ctx.fpscr.csr));", f(insn.operands[0]), f(insn.operands[1]));
++            break;
++        }
+         printSetFlushMode(false);
+         println("\t{}.f64 = double(float({}.f64));", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+@@ -1064,7 +1191,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LFD:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("\t{}.u64 = PPC_LOAD_U64(", f(insn.operands[0]));
+         if (insn.operands[2] != 0)
+             print("{}.u32 + ", r(insn.operands[2]));
+@@ -1072,7 +1199,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LFDX:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("\t{}.u64 = PPC_LOAD_U64(", f(insn.operands[0]));
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1080,22 +1207,36 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LFS:
+-        printSetFlushMode(false);
++    {
++        const bool anyMode = keepsVmxMode();
++        if (!anyMode)
++            printSetFlushMode(false);
+         print("\t{}.u32 = PPC_LOAD_U32(", temp());
+         if (insn.operands[2] != 0)
+             print("{}.u32 + ", r(insn.operands[2]));
+         println("{});", int32_t(insn.operands[1]));
+-        println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
++        if (anyMode)
++            println("\t{}.f64 = PPCFloatToDoubleAnyMode({}.u32);", f(insn.operands[0]), temp());
++        else
++            println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
+         break;
++    }
+ 
+     case PPC_INST_LFSX:
+-        printSetFlushMode(false);
++    {
++        const bool anyMode = keepsVmxMode();
++        if (!anyMode)
++            printSetFlushMode(false);
+         print("\t{}.u32 = PPC_LOAD_U32(", temp());
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+         println("{}.u32);", r(insn.operands[2]));
+-        println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
++        if (anyMode)
++            println("\t{}.f64 = PPCFloatToDoubleAnyMode({}.u32);", f(insn.operands[0]), temp());
++        else
++            println("\t{}.f64 = double({}.f32);", f(insn.operands[0]), temp());
+         break;
++    }
+ 
+     case PPC_INST_LHA:
+         print("\t{}.s64 = int16_t(PPC_LOAD_U16(", r(insn.operands[0]));
+@@ -1209,7 +1350,7 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_LWSYNC:
@@ -171,7 +451,7 @@ index fa91527..f3b15cd 100644
          break;
  
      case PPC_INST_LWZ:
-@@ -1503,10 +1545,10 @@ bool Recompiler::Recompile(
+@@ -1503,10 +1644,10 @@ bool Recompiler::Recompile(
      case PPC_INST_STDCX:
          println("\t{}.lt = 0;", cr(0));
          println("\t{}.gt = 0;", cr(0));
@@ -184,7 +464,66 @@ index fa91527..f3b15cd 100644
          println("\t{}.so = {}.so;", cr(0), xer());
          break;
  
-@@ -1658,10 +1700,10 @@ bool Recompiler::Recompile(
+@@ -1524,7 +1665,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFD:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U64(" : "\tPPC_STORE_U64(");
+         if (insn.operands[2] != 0)
+             print("{}.u32 + ", r(insn.operands[2]));
+@@ -1532,7 +1673,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFDX:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U64(" : "\tPPC_STORE_U64(");
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1540,7 +1681,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFIWX:
+-        printSetFlushMode(false);
++        printSetFlushModeUnlessVmx();
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U32(" : "\tPPC_STORE_U32(");
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1548,8 +1689,13 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFS:
+-        printSetFlushMode(false);
+-        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        if (keepsVmxMode())
++            println("\t{}.u32 = PPCDoubleToFloatBitsAnyMode({}.u64, ctx.fpscr.csr);", temp(), f(insn.operands[0]));
++        else
++        {
++            printSetFlushMode(false);
++            println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        }
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U32(" : "\tPPC_STORE_U32(");
+         if (insn.operands[2] != 0)
+             print("{}.u32 + ", r(insn.operands[2]));
+@@ -1557,8 +1703,13 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_STFSX:
+-        printSetFlushMode(false);
+-        println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        if (keepsVmxMode())
++            println("\t{}.u32 = PPCDoubleToFloatBitsAnyMode({}.u64, ctx.fpscr.csr);", temp(), f(insn.operands[0]));
++        else
++        {
++            printSetFlushMode(false);
++            println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
++        }
+         print("{}", mmioStore() ? "\tPPC_MM_STORE_U32(" : "\tPPC_STORE_U32(");
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+@@ -1658,10 +1809,10 @@ bool Recompiler::Recompile(
      case PPC_INST_STWCX:
          println("\t{}.lt = 0;", cr(0));
          println("\t{}.gt = 0;", cr(0));
@@ -197,7 +536,7 @@ index fa91527..f3b15cd 100644
          println("\t{}.so = {}.so;", cr(0), xer());
          break;
  
-@@ -1711,7 +1753,7 @@ bool Recompiler::Recompile(
+@@ -1711,7 +1862,7 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_SYNC:
@@ -206,7 +545,60 @@ index fa91527..f3b15cd 100644
          break;
  
      case PPC_INST_TDLGEI:
-@@ -2002,7 +2044,7 @@ bool Recompiler::Recompile(
+@@ -1787,7 +1938,8 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCTSXS:
+     case PPC_INST_VCFPSXWS128:
+-        printSetFlushMode(true);
++        // A denormal (times at most 2^31) truncates to 0 whether or not FZ makes it a zero first.
++        printSetFlushModeUnlessFpu();
+         print("\tsimde_mm_store_si128((simde__m128i*){}.s32, simde_mm_vctsxs(", v(insn.operands[0]));
+         if (insn.operands[2] != 0)
+             println("simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_set1_ps({}))));", v(insn.operands[1]), 1u << insn.operands[2]);
+@@ -1798,7 +1950,8 @@ bool Recompiler::Recompile(
+     case PPC_INST_VCFSX:
+     case PPC_INST_VCSXWFP128:
+     {
+-        printSetFlushMode(true);
++        // An integer as a float is 0 or at least 1 in magnitude, and at least 2^-31 after the scale: never a denormal.
++        printSetFlushModeUnlessFpu();
+         print("\tsimde_mm_store_ps({}.f32, ", v(insn.operands[0]));
+         if (insn.operands[2] != 0)
+         {
+@@ -1815,7 +1968,7 @@ bool Recompiler::Recompile(
+     case PPC_INST_VCFUX:
+     case PPC_INST_VCUXWFP128:
+     {
+-        printSetFlushMode(true);
++        printSetFlushModeUnlessFpu();
+         print("\tsimde_mm_store_ps({}.f32, ", v(insn.operands[0]));
+         if (insn.operands[2] != 0)
+         {
+@@ -1899,7 +2052,10 @@ bool Recompiler::Recompile(
+     case PPC_INST_VMADDFP:
+     case PPC_INST_VMADDFP128:
+         printSetFlushMode(true);
+-        println("\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
++        if (explicitFma)
++            println("\tsimde_mm_store_ps({}.f32, PPCVectorFma(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
++        else
++            println("\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_VMAXFP:
+@@ -1963,7 +2119,10 @@ bool Recompiler::Recompile(
+     case PPC_INST_VNMSUBFP:
+     case PPC_INST_VNMSUBFP128:
+         printSetFlushMode(true);
+-        println("\tsimde_mm_store_ps({}.f32, simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
++        if (explicitFma)
++            println("\tsimde_mm_store_ps({}.f32, PPCVectorNegatedFms(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
++        else
++            println("\tsimde_mm_store_ps({}.f32, simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), v(insn.operands[3]));
+         break;
+ 
+     case PPC_INST_VOR:
+@@ -2002,7 +2161,7 @@ bool Recompiler::Recompile(
          {
          case 0: // D3D color
              if (insn.operands[3] != 1)
@@ -215,7 +607,7 @@ index fa91527..f3b15cd 100644
  
              for (size_t i = 0; i < 4; i++)
              {
-@@ -2016,7 +2058,7 @@ bool Recompiler::Recompile(
+@@ -2016,7 +2175,7 @@ bool Recompiler::Recompile(
  
          case 5: // float16_4
              if (insn.operands[3] != 2 || insn.operands[4] > 2)
@@ -224,7 +616,51 @@ index fa91527..f3b15cd 100644
  
              for (size_t i = 0; i < 4; i++)
              {
-@@ -2272,7 +2314,7 @@ bool Recompiler::Recompile(
+@@ -2051,7 +2210,10 @@ bool Recompiler::Recompile(
+     case PPC_INST_VREFP128:
+         // TODO: see if we can use rcp safely
+         printSetFlushMode(true);
+-        println("\tsimde_mm_store_ps({}.f32, simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]));
++        if (scalarRsqrt && vectorDotProduct[insn.operands[1] & 127])
++            println("\t{{ const float dot_ = simde_mm_cvtss_f32(simde_mm_load_ps({}.f32)); simde_mm_store_ps({}.f32, simde_mm_set1_ps(1.0f / dot_)); }}", v(insn.operands[1]), v(insn.operands[0]));
++        else
++            println("\tsimde_mm_store_ps({}.f32, simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_load_ps({}.f32)));", v(insn.operands[0]), v(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_VRFIM:
+@@ -2062,13 +2224,14 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VRFIN:
+     case PPC_INST_VRFIN128:
+-        printSetFlushMode(true);
++        // A denormal rounds to the zero of its sign in either mode (FZ gives that zero first).
++        printSetFlushModeUnlessFpu();
+         println("\tsimde_mm_store_ps({}.f32, simde_mm_round_ps(simde_mm_load_ps({}.f32), SIMDE_MM_FROUND_TO_NEAREST_INT | SIMDE_MM_FROUND_NO_EXC));", v(insn.operands[0]), v(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_VRFIZ:
+     case PPC_INST_VRFIZ128:
+-        printSetFlushMode(true);
++        printSetFlushModeUnlessFpu();
+         println("\tsimde_mm_store_ps({}.f32, simde_mm_round_ps(simde_mm_load_ps({}.f32), SIMDE_MM_FROUND_TO_ZERO | SIMDE_MM_FROUND_NO_EXC));", v(insn.operands[0]), v(insn.operands[1]));
+         break;
+ 
+@@ -2082,9 +2245,12 @@ bool Recompiler::Recompile(
+     case PPC_INST_VRSQRTEFP:
+     case PPC_INST_VRSQRTEFP128:
+         // TODO: see if we can use rsqrt safely
+-        // TODO: we can detect if the input is from a dot product and apply logic only on one value
++        // [Switch] Round 15, scalarRsqrt: from a dot product (all four lanes equal), one scalar sqrt and division.
+         printSetFlushMode(true);
+-        println("\tsimde_mm_store_ps({}.f32, simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({}.f32))));", v(insn.operands[0]), v(insn.operands[1]));
++        if (scalarRsqrt && vectorDotProduct[insn.operands[1] & 127])
++            println("\t{{ const float dot_ = simde_mm_cvtss_f32(simde_mm_load_ps({}.f32)); simde_mm_store_ps({}.f32, simde_mm_set1_ps(1.0f / __builtin_sqrtf(dot_))); }}", v(insn.operands[1]), v(insn.operands[0]));
++        else
++            println("\tsimde_mm_store_ps({}.f32, simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({}.f32))));", v(insn.operands[0]), v(insn.operands[1]));
+         break;
+ 
+     case PPC_INST_VSEL:
+@@ -2272,16 +2438,47 @@ bool Recompiler::Recompile(
      {
          int lastLine = out.find_last_of('\n', out.size() - 2);
          if (out.find("cr0", lastLine + 1) == std::string::npos && out.find("cr6", lastLine + 1) == std::string::npos)
@@ -233,7 +669,34 @@ index fa91527..f3b15cd 100644
      }
  #endif
  
-@@ -2282,6 +2324,13 @@ bool Recompiler::Recompile(
+     if (midAsmHook != config.midAsmHooks.end() && midAsmHook->second.afterInstruction)
+         printMidAsmHook();
+-    
++
++    // [Switch] Round 15, scalarRsqrt: which vector registers hold a vmsum3fp/vmsum4fp result (all lanes equal). Any
++    // other instruction forgets its first operand (a vector destination, or another register file's: forgetting more
++    // than needed is safe); calls and hooks forget everything; labels too (printBody).
++    switch (insn.opcode->id)
++    {
++    case PPC_INST_VMSUM3FP128:
++    case PPC_INST_VMSUM4FP128:
++        vectorDotProduct[insn.operands[0] & 127] = true;
++        break;
++    case PPC_INST_BL:
++    case PPC_INST_BLRL:
++    case PPC_INST_BCTRL:
++    case PPC_INST_BCTR:
++    case PPC_INST_B:
++    case PPC_INST_BLR:
++        vectorDotProduct.fill(false);
++        break;
++    default:
++        vectorDotProduct[insn.operands[0] & 127] = false;
++        break;
++    }
++    if (midAsmHook != config.midAsmHooks.end())
++        vectorDotProduct.fill(false);
++
      return true;
  }
  
@@ -247,7 +710,7 @@ index fa91527..f3b15cd 100644
  bool Recompiler::Recompile(const Function& fn)
  {
      auto base = fn.base;
-@@ -2388,9 +2437,73 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2388,9 +2585,73 @@ bool Recompiler::Recompile(const Function& fn)
      println("PPC_FUNC_IMPL(__imp__{}) {{", name);
      println("\tPPC_FUNC_PROLOGUE();");
  
@@ -324,7 +787,7 @@ index fa91527..f3b15cd 100644
  
      // TODO: the printing scheme here is scuffed
      RecompilerLocalVariables localVariables;
-@@ -2398,45 +2511,121 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2398,45 +2659,123 @@ bool Recompiler::Recompile(const Function& fn)
      tempString.clear();
      std::swap(out, tempString);
  
@@ -348,11 +811,13 @@ index fa91527..f3b15cd 100644
 +                RecordCsrEdge(fn.base, CSRState::Unknown);
 +
 +            ppc_insn insn;
++            vectorDotProduct.fill(false);
 +            while (base < end)
 +            {
 +                if (labels.find(base) != labels.end())
 +                {
 +                    println("loc_{:X}:", base);
++                    vectorDotProduct.fill(false);
  
 -            // Anyone could jump to this label so we wouldn't know what the CSR state would be.
 -            csrState = CSRState::Unknown;
@@ -474,10 +939,10 @@ index fa91527..f3b15cd 100644
  #if 0
      if (insn.opcode == nullptr || (insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BCTR && insn.opcode->id != PPC_INST_BLR))
 diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
-index 8242db5..65d43fe 100644
+index 8242db5..ef2aff6 100644
 --- a/XenonRecomp/recompiler.h
 +++ b/XenonRecomp/recompiler.h
-@@ -35,6 +35,29 @@ struct Recompiler
+@@ -35,6 +35,57 @@ struct Recompiler
      size_t cppFileIndex = 0;
      RecompilerConfig config;
  
@@ -491,6 +956,34 @@ index 8242db5..65d43fe 100644
 +    bool loopBarriers = true;
 +    bool skipCalleeSaves = true;
 +    bool csrAcrossLabels = true;
++
++    // [Switch] Round 14, XENON_RECOMP_FEWER_MODE_SWITCHES=1 (off by default): while the flush mode is known to be the
++    // VMX one, a scalar instruction whose result does not depend on it leaves it alone instead of switching to the FPU
++    // mode (each switch is an msr fpcr, which waits for every floating-point instruction in flight). Those are the moves
++    // (fmr, fabs, fnabs, fneg, lfd, lfdx, stfd, stfdx, stfiwx), the conversions fcfid, fctidz and fctiwz, and, through
++    // exact helpers in ppc_context.h, lfs/lfsx (PPCFloatToDoubleAnyMode), stfs/stfsx/frsp (PPCDoubleToFloatBitsAnyMode)
++    // and fcmpu (compareBits). In the other direction, while the FPU mode is known, the vector conversions between
++    // integers and floats (vcfsx, vcfux, vctsxs and their 128 forms) and the roundings to nearest and towards zero
++    // (vrfin, vrfiz) leave it alone: no denormal can reach or leave them differently. Where the mode is unknown the code
++    // is unchanged, so no branch is added or removed there.
++    // Level 2 (XENON_RECOMP_FEWER_MODE_SWITCHES=2) also drops the conditional switch where the mode is unknown (after a
++    // call or a label) for the instructions that need no exact helper (the moves, fcfid, fctidz, fctiwz and the vector
++    // conversions), which then leave it unknown. That removes branches, so it changes the control flow of the functions
++    // concerned (thousands) and with it their match with a PGO profile: for a build whose profile is collected with it.
++    int fewerModeSwitches = 0;
++
++    // [Switch] Round 15, XENON_RECOMP_EXPLICIT_FMA=1 (tools/build-switch.sh SWITCH_EXPLICIT_FMA, which also compiles
++    // everything with -ffp-contract=off): the guest's fused multiply-adds (fmadd[s], fmsub[s], fnmadd[s], fnmsub[s],
++    // vmaddfp, vnmsubfp, vmaddcfp128) as explicit fused operations (__builtin_fma, PPCVectorFma), giving the results
++    // GCC's contraction of those single expressions gave; with contraction off, nothing else is fused, so every other
++    // guest operation rounds on its own as on the Xbox 360, and no code generation change can move a rounding.
++    bool explicitFma = false;
++
++    // [Switch] Round 15, XENON_RECOMP_SCALAR_RSQRT=1: vrsqrtefp and vrefp whose source was last written, in the same
++    // basic block (no label, call or mid-asm hook in between), by vmsum3fp/vmsum4fp, whose four lanes hold the same
++    // sum: one scalar sqrt and division, broadcast (the vector ones round each lane the same way).
++    bool scalarRsqrt = false;
++    std::array<bool, 128> vectorDotProduct{};
 +
 +    // Per function: the flush mode assumed at each label while printing, and the meet of the modes
 +    // recorded on the branches into each label (a missing entry means no branch recorded yet).
@@ -508,18 +1001,47 @@ index 8242db5..65d43fe 100644
  
      template<class... Args>
 diff --git a/XenonUtils/file.h b/XenonUtils/file.h
-index 8d0f2ae..eb2cc22 100644
+index 8d0f2ae..66d3d7d 100644
 --- a/XenonUtils/file.h
 +++ b/XenonUtils/file.h
-@@ -2,10 +2,62 @@
- 
- #include <filesystem>
- #include <fstream>
+@@ -1,28 +1,81 @@
+-#pragma once
+-
+-#include <filesystem>
+-#include <fstream>
+-#include <vector>
+-
+-inline std::vector<uint8_t> LoadFile(const std::filesystem::path& path)
+-{
+-    std::ifstream stream(path, std::ios::binary);
+-    if (!stream.is_open())
+-    {
+-        return {};
+-    }
+-
+-    stream.seekg(0, std::ios::end);
+-    std::streampos size = stream.tellg();
+-    stream.seekg(0, std::ios::beg);
+-
+-    std::vector<uint8_t> data;
+-    data.resize(size);
+-    stream.read((char *)(data.data()), size);
+-    if (stream.bad())
+-    {
+-        return {};
+-    }
+-
+-    return data;
+-}
++#pragma once
++
++#include <filesystem>
++#include <fstream>
 +#include <cstdio>
- #include <vector>
- 
- inline std::vector<uint8_t> LoadFile(const std::filesystem::path& path)
- {
++#include <vector>
++
++inline std::vector<uint8_t> LoadFile(const std::filesystem::path& path)
++{
 +#if defined(__SWITCH__)
 +    FILE* file = fopen(path.string().c_str(), "rb");
 +    if (file == nullptr)
@@ -571,46 +1093,295 @@ index 8d0f2ae..eb2cc22 100644
 +
 +    return data;
 +#else
-     std::ifstream stream(path, std::ios::binary);
-     if (!stream.is_open())
-     {
-@@ -25,4 +77,5 @@ inline std::vector<uint8_t> LoadFile(const std::filesystem::path& path)
-     }
- 
-     return data;
++    std::ifstream stream(path, std::ios::binary);
++    if (!stream.is_open())
++    {
++        return {};
++    }
++
++    stream.seekg(0, std::ios::end);
++    std::streampos size = stream.tellg();
++    stream.seekg(0, std::ios::beg);
++
++    std::vector<uint8_t> data;
++    data.resize(size);
++    stream.read((char *)(data.data()), size);
++    if (stream.bad())
++    {
++        return {};
++    }
++
++    return data;
 +#endif
- }
++}
 diff --git a/XenonUtils/memory_mapped_file.cpp b/XenonUtils/memory_mapped_file.cpp
-index ba3c5d8..0936217 100644
+index ba3c5d8..793dca6 100644
 --- a/XenonUtils/memory_mapped_file.cpp
 +++ b/XenonUtils/memory_mapped_file.cpp
-@@ -1,6 +1,9 @@
- #include "memory_mapped_file.h"
- 
+@@ -1,169 +1,223 @@
+-#include "memory_mapped_file.h"
+-
 -#if !defined(_WIN32)
+-#   include <cstring>
+-#   include <cstdio>
+-#   include <fcntl.h>
+-#   include <unistd.h>
+-#endif
+-
+-MemoryMappedFile::MemoryMappedFile()
+-{
+-    // Default constructor.
+-}
+-
+-MemoryMappedFile::MemoryMappedFile(const std::filesystem::path &path)
+-{
+-    open(path);
+-}
+-
+-MemoryMappedFile::~MemoryMappedFile()
+-{
+-    close();
+-}
+-
+-MemoryMappedFile::MemoryMappedFile(MemoryMappedFile &&other)
+-{
+-#if defined(_WIN32)
+-    fileHandle = other.fileHandle;
+-    fileMappingHandle = other.fileMappingHandle;
+-    fileView = other.fileView;
+-    fileSize = other.fileSize;
+-
+-    other.fileHandle = nullptr;
+-    other.fileMappingHandle = nullptr;
+-    other.fileView = nullptr;
+-    other.fileSize.QuadPart = 0;
+-#else
+-    fileHandle = other.fileHandle;
+-    fileView = other.fileView;
+-    fileSize = other.fileSize;
+-
+-    other.fileHandle = -1;
+-    other.fileView = MAP_FAILED;
+-    other.fileSize = 0;
+-#endif
+-}
+-
+-bool MemoryMappedFile::open(const std::filesystem::path &path)
+-{
+-#if defined(_WIN32)
+-    fileHandle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+-    if (fileHandle == INVALID_HANDLE_VALUE)
+-    {
+-        fprintf(stderr, "CreateFileW failed with error %lu.\n", GetLastError());
+-        fileHandle = nullptr;
+-        return false;
+-    }
+-
+-    if (!GetFileSizeEx(fileHandle, &fileSize))
+-    {
+-        fprintf(stderr, "GetFileSizeEx failed with error %lu.\n", GetLastError());
+-        CloseHandle(fileHandle);
+-        fileHandle = nullptr;
+-        return false;
+-    }
+-
+-    fileMappingHandle = CreateFileMappingW(fileHandle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+-    if (fileMappingHandle == nullptr)
+-    {
+-        fprintf(stderr, "CreateFileMappingW failed with error %lu.\n", GetLastError());
+-        CloseHandle(fileHandle);
+-        fileHandle = nullptr;
+-        return false;
+-    }
+-
+-    fileView = MapViewOfFile(fileMappingHandle, FILE_MAP_READ, 0, 0, 0);
+-    if (fileView == nullptr)
+-    {
+-        fprintf(stderr, "MapViewOfFile failed with error %lu.\n", GetLastError());
+-        CloseHandle(fileMappingHandle);
+-        CloseHandle(fileHandle);
+-        fileMappingHandle = nullptr;
+-        fileHandle = nullptr;
+-        return false;
+-    }
+-
+-    return true;
+-#else
+-    fileHandle = ::open(path.c_str(), O_RDONLY);
+-    if (fileHandle == -1)
+-    {
+-        fprintf(stderr, "open for %s failed with error %s.\n", path.c_str(), strerror(errno));
+-        return false;
+-    }
+-
+-    fileSize = lseek(fileHandle, 0, SEEK_END);
+-    if (fileSize == (off_t)(-1))
+-    {
+-        fprintf(stderr, "lseek failed with error %s.\n", strerror(errno));
+-        ::close(fileHandle);
+-        fileHandle = -1;
+-        return false;
+-    }
+-
+-    fileView = mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fileHandle, 0);
+-    if (fileView == MAP_FAILED)
+-    {
+-        fprintf(stderr, "mmap failed with error %s.\n", strerror(errno));
+-        ::close(fileHandle);
+-        fileHandle = -1;
+-        return false;
+-    }
+-
+-    return true;
+-#endif
+-}
+-
+-void MemoryMappedFile::close()
+-{
+-#if defined(_WIN32)
+-    if (fileView != nullptr)
+-    {
+-        UnmapViewOfFile(fileView);
+-    }
+-
+-    if (fileMappingHandle != nullptr)
+-    {
+-        CloseHandle(fileMappingHandle);
+-    }
+-
+-    if (fileHandle != nullptr)
+-    {
+-        CloseHandle(fileHandle);
+-    }
+-#else
+-    if (fileView != MAP_FAILED)
+-    {
+-        munmap(fileView, fileSize);
+-    }
+-
+-    if (fileHandle != -1)
+-    {
+-        ::close(fileHandle);
+-    }
+-#endif
+-}
+-
+-bool MemoryMappedFile::isOpen() const
+-{
+-#if defined(_WIN32)
+-    return (fileView != nullptr);
+-#else
+-    return (fileView != MAP_FAILED);
+-#endif
+-}
+-
+-uint8_t *MemoryMappedFile::data() const
+-{
+-    return reinterpret_cast<uint8_t *>(fileView);
+-}
+-
+-size_t MemoryMappedFile::size() const
+-{
+-#if defined(_WIN32)
+-    return fileSize.QuadPart;
+-#else
+-    return static_cast<size_t>(fileSize);
+-#endif
+-}
++#include "memory_mapped_file.h"
++
 +#if defined(__SWITCH__)
 +#   include <fstream>
 +#elif !defined(_WIN32)
 +#   include <cerrno>
- #   include <cstring>
- #   include <cstdio>
- #   include <fcntl.h>
-@@ -34,6 +37,11 @@ MemoryMappedFile::MemoryMappedFile(MemoryMappedFile &&other)
-     other.fileMappingHandle = nullptr;
-     other.fileView = nullptr;
-     other.fileSize.QuadPart = 0;
++#   include <cstring>
++#   include <cstdio>
++#   include <fcntl.h>
++#   include <unistd.h>
++#endif
++
++MemoryMappedFile::MemoryMappedFile()
++{
++    // Default constructor.
++}
++
++MemoryMappedFile::MemoryMappedFile(const std::filesystem::path &path)
++{
++    open(path);
++}
++
++MemoryMappedFile::~MemoryMappedFile()
++{
++    close();
++}
++
++MemoryMappedFile::MemoryMappedFile(MemoryMappedFile &&other)
++{
++#if defined(_WIN32)
++    fileHandle = other.fileHandle;
++    fileMappingHandle = other.fileMappingHandle;
++    fileView = other.fileView;
++    fileSize = other.fileSize;
++
++    other.fileHandle = nullptr;
++    other.fileMappingHandle = nullptr;
++    other.fileView = nullptr;
++    other.fileSize.QuadPart = 0;
 +#elif defined(__SWITCH__)
 +    fileData = std::move(other.fileData);
 +    opened = other.opened;
 +
 +    other.opened = false;
- #else
-     fileHandle = other.fileHandle;
-     fileView = other.fileView;
-@@ -84,6 +92,41 @@ bool MemoryMappedFile::open(const std::filesystem::path &path)
-         return false;
-     }
- 
++#else
++    fileHandle = other.fileHandle;
++    fileView = other.fileView;
++    fileSize = other.fileSize;
++
++    other.fileHandle = -1;
++    other.fileView = MAP_FAILED;
++    other.fileSize = 0;
++#endif
++}
++
++bool MemoryMappedFile::open(const std::filesystem::path &path)
++{
++#if defined(_WIN32)
++    fileHandle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (fileHandle == INVALID_HANDLE_VALUE)
++    {
++        fprintf(stderr, "CreateFileW failed with error %lu.\n", GetLastError());
++        fileHandle = nullptr;
++        return false;
++    }
++
++    if (!GetFileSizeEx(fileHandle, &fileSize))
++    {
++        fprintf(stderr, "GetFileSizeEx failed with error %lu.\n", GetLastError());
++        CloseHandle(fileHandle);
++        fileHandle = nullptr;
++        return false;
++    }
++
++    fileMappingHandle = CreateFileMappingW(fileHandle, nullptr, PAGE_READONLY, 0, 0, nullptr);
++    if (fileMappingHandle == nullptr)
++    {
++        fprintf(stderr, "CreateFileMappingW failed with error %lu.\n", GetLastError());
++        CloseHandle(fileHandle);
++        fileHandle = nullptr;
++        return false;
++    }
++
++    fileView = MapViewOfFile(fileMappingHandle, FILE_MAP_READ, 0, 0, 0);
++    if (fileView == nullptr)
++    {
++        fprintf(stderr, "MapViewOfFile failed with error %lu.\n", GetLastError());
++        CloseHandle(fileMappingHandle);
++        CloseHandle(fileHandle);
++        fileMappingHandle = nullptr;
++        fileHandle = nullptr;
++        return false;
++    }
++
 +    return true;
 +#elif defined(__SWITCH__)
 +    close();
@@ -646,73 +1417,176 @@ index ba3c5d8..0936217 100644
 +    }
 +
 +    opened = true;
-     return true;
- #else
-     fileHandle = ::open(path.c_str(), O_RDONLY);
-@@ -132,6 +175,9 @@ void MemoryMappedFile::close()
-     {
-         CloseHandle(fileHandle);
-     }
++    return true;
++#else
++    fileHandle = ::open(path.c_str(), O_RDONLY);
++    if (fileHandle == -1)
++    {
++        fprintf(stderr, "open for %s failed with error %s.\n", path.c_str(), strerror(errno));
++        return false;
++    }
++
++    fileSize = lseek(fileHandle, 0, SEEK_END);
++    if (fileSize == (off_t)(-1))
++    {
++        fprintf(stderr, "lseek failed with error %s.\n", strerror(errno));
++        ::close(fileHandle);
++        fileHandle = -1;
++        return false;
++    }
++
++    fileView = mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fileHandle, 0);
++    if (fileView == MAP_FAILED)
++    {
++        fprintf(stderr, "mmap failed with error %s.\n", strerror(errno));
++        ::close(fileHandle);
++        fileHandle = -1;
++        return false;
++    }
++
++    return true;
++#endif
++}
++
++void MemoryMappedFile::close()
++{
++#if defined(_WIN32)
++    if (fileView != nullptr)
++    {
++        UnmapViewOfFile(fileView);
++    }
++
++    if (fileMappingHandle != nullptr)
++    {
++        CloseHandle(fileMappingHandle);
++    }
++
++    if (fileHandle != nullptr)
++    {
++        CloseHandle(fileHandle);
++    }
 +#elif defined(__SWITCH__)
 +    fileData.clear();
 +    opened = false;
- #else
-     if (fileView != MAP_FAILED)
-     {
-@@ -149,6 +195,8 @@ bool MemoryMappedFile::isOpen() const
- {
- #if defined(_WIN32)
-     return (fileView != nullptr);
++#else
++    if (fileView != MAP_FAILED)
++    {
++        munmap(fileView, fileSize);
++    }
++
++    if (fileHandle != -1)
++    {
++        ::close(fileHandle);
++    }
++#endif
++}
++
++bool MemoryMappedFile::isOpen() const
++{
++#if defined(_WIN32)
++    return (fileView != nullptr);
 +#elif defined(__SWITCH__)
 +    return opened;
- #else
-     return (fileView != MAP_FAILED);
- #endif
-@@ -156,13 +204,19 @@ bool MemoryMappedFile::isOpen() const
- 
- uint8_t *MemoryMappedFile::data() const
- {
++#else
++    return (fileView != MAP_FAILED);
++#endif
++}
++
++uint8_t *MemoryMappedFile::data() const
++{
 +#if defined(__SWITCH__)
 +    return const_cast<uint8_t*>(fileData.data());
 +#else
-     return reinterpret_cast<uint8_t *>(fileView);
++    return reinterpret_cast<uint8_t *>(fileView);
 +#endif
- }
- 
- size_t MemoryMappedFile::size() const
- {
- #if defined(_WIN32)
-     return fileSize.QuadPart;
++}
++
++size_t MemoryMappedFile::size() const
++{
++#if defined(_WIN32)
++    return fileSize.QuadPart;
 +#elif defined(__SWITCH__)
 +    return fileData.size();
- #else
-     return static_cast<size_t>(fileSize);
- #endif
++#else
++    return static_cast<size_t>(fileSize);
++#endif
++}
 diff --git a/XenonUtils/memory_mapped_file.h b/XenonUtils/memory_mapped_file.h
-index a3de88b..f1b42c4 100644
+index a3de88b..c7f3ffe 100644
 --- a/XenonUtils/memory_mapped_file.h
 +++ b/XenonUtils/memory_mapped_file.h
-@@ -4,6 +4,8 @@
- 
- #if defined(_WIN32)
- #   include <Windows.h>
+@@ -1,32 +1,37 @@
+-#pragma once
+-
+-#include <filesystem>
+-
+-#if defined(_WIN32)
+-#   include <Windows.h>
+-#else
+-#   include <sys/mman.h>
+-#endif
+-
+-struct MemoryMappedFile {
+-#if defined(_WIN32)
+-    HANDLE fileHandle = nullptr;
+-    HANDLE fileMappingHandle = nullptr;
+-    LPVOID fileView = nullptr;
+-    LARGE_INTEGER fileSize = {};
+-#else
+-    int fileHandle = -1;
+-    void *fileView = MAP_FAILED;
+-    off_t fileSize = 0;
+-#endif
+-
+-    MemoryMappedFile();
+-    MemoryMappedFile(const std::filesystem::path &path);
+-    MemoryMappedFile(MemoryMappedFile &&other);
+-    ~MemoryMappedFile();
+-    bool open(const std::filesystem::path &path);
+-    void close();
+-    bool isOpen() const;
+-    uint8_t *data() const;
+-    size_t size() const;
+-};
++#pragma once
++
++#include <filesystem>
++
++#if defined(_WIN32)
++#   include <Windows.h>
 +#elif defined(__SWITCH__)
 +#   include <vector>
- #else
- #   include <sys/mman.h>
- #endif
-@@ -14,6 +16,9 @@ struct MemoryMappedFile {
-     HANDLE fileMappingHandle = nullptr;
-     LPVOID fileView = nullptr;
-     LARGE_INTEGER fileSize = {};
++#else
++#   include <sys/mman.h>
++#endif
++
++struct MemoryMappedFile {
++#if defined(_WIN32)
++    HANDLE fileHandle = nullptr;
++    HANDLE fileMappingHandle = nullptr;
++    LPVOID fileView = nullptr;
++    LARGE_INTEGER fileSize = {};
 +#elif defined(__SWITCH__)
 +    std::vector<uint8_t> fileData;
 +    bool opened = false;
- #else
-     int fileHandle = -1;
-     void *fileView = MAP_FAILED;
++#else
++    int fileHandle = -1;
++    void *fileView = MAP_FAILED;
++    off_t fileSize = 0;
++#endif
++
++    MemoryMappedFile();
++    MemoryMappedFile(const std::filesystem::path &path);
++    MemoryMappedFile(MemoryMappedFile &&other);
++    ~MemoryMappedFile();
++    bool open(const std::filesystem::path &path);
++    void close();
++    bool isOpen() const;
++    uint8_t *data() const;
++    size_t size() const;
++};
 diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
-index 31a86cd..4982be7 100644
+index 31a86cd..864ac9b 100644
 --- a/XenonUtils/ppc_context.h
 +++ b/XenonUtils/ppc_context.h
 @@ -5,6 +5,7 @@
@@ -723,7 +1597,7 @@ index 31a86cd..4982be7 100644
  #include <climits>
  #include <cmath>
  #include <csetjmp>
-@@ -16,6 +17,76 @@
+@@ -16,6 +17,151 @@
  #include <x86/sse.h>
  #include <x86/sse4.1.h>
  
@@ -797,10 +1671,85 @@ index 31a86cd..4982be7 100644
 +#define __builtin_rotateleft64(x, y) PPCRotateLeft64(static_cast<uint64_t>(x), static_cast<unsigned int>(y))
 +#endif
 +
++// [Switch] Round 15 (XENON_RECOMP_EXPLICIT_FMA): vmaddfp as a*b + c with one rounding (what GCC's contraction of the
++// former simde_mm_add_ps(simde_mm_mul_ps(a, b), c) gave), and vnmsubfp as -(a*b - c) with one rounding, written as GCC
++// compiled the former xor(sub(mul(a, b), c), sign bit): a fused a*b + (-c), then the sign flipped (so an exact zero
++// difference gives -0, as -(a*b - c) does).
++static inline simde__m128 PPCVectorFma(simde__m128 a, simde__m128 b, simde__m128 c) noexcept
++{
++#if defined(__aarch64__)
++    return simde__m128_from_neon_f32(vfmaq_f32(simde__m128_to_neon_f32(c), simde__m128_to_neon_f32(a), simde__m128_to_neon_f32(b)));
++#else
++    return simde_mm_add_ps(simde_mm_mul_ps(a, b), c);
++#endif
++}
++
++static inline simde__m128 PPCVectorNegatedFms(simde__m128 a, simde__m128 b, simde__m128 c) noexcept
++{
++    const simde__m128 sign = simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)));
++    return simde_mm_xor_ps(PPCVectorFma(a, b, simde_mm_xor_ps(c, sign)), sign);
++}
++
++// [Switch] Round 14 (XENON_RECOMP_FEWER_MODE_SWITCHES): lfs between VMX instructions, which run with FPCR.FZ set. A
++// float's conversion to double is exact in either mode except for the denormals, which FZ turns into zeros; for those
++// (biased exponent 0) the value is built from the significand instead: an integer below 2^23 times 2^-149, both exact
++// and normal as doubles, and so is their product (zeros come out as zeros, with their sign). NaNs and infinities take
++// the conversion, which FZ does not touch. No branch.
++static inline double PPCFloatToDoubleAnyMode(uint32_t bits) noexcept
++{
++    float single;
++    std::memcpy(&single, &bits, sizeof(single));
++    const double converted = double(single);
++    const double denormal = double(int32_t(bits & 0x7FFFFF)) * 0x1p-149;
++    uint64_t convertedBits;
++    uint64_t denormalBits;
++    std::memcpy(&convertedBits, &converted, sizeof(convertedBits));
++    std::memcpy(&denormalBits, &denormal, sizeof(denormalBits));
++    denormalBits |= uint64_t(bits & 0x80000000) << 32;
++    const uint64_t useDenormal = -uint64_t((bits & 0x7F800000) == 0);
++    const uint64_t result = (convertedBits & ~useDenormal) | (denormalBits & useDenormal);
++    double value;
++    std::memcpy(&value, &result, sizeof(value));
++    return value;
++}
++
++// [Switch] Round 14 (XENON_RECOMP_FEWER_MODE_SWITCHES): stfs, stfsx and frsp between VMX instructions (FPCR.FZ set). A
++// double of magnitude 2^-126 or more converts to the same float in either mode. FZ flushes anything smaller to zero (a
++// float denormal result, or a double denormal operand), so those are rounded here as they are without FZ: the
++// significand shifted to units of 2^-149 and rounded in the FPCR's rounding mode (csr, the cached FPCR: RMode in bits 22
++// and 23, 0 to nearest even, 1 towards +infinity, 2 towards -infinity, 3 towards zero); a carry into bit 23 gives the
++// smallest normal float, as the hardware's rounding does. NaNs and infinities take the conversion. No branch, and the
++// shift stays within 30 to 63 for every input, so nothing is undefined for the values whose result is not used.
++static inline uint32_t PPCDoubleToFloatBitsAnyMode(uint64_t bits, uint32_t csr) noexcept
++{
++    double value;
++    std::memcpy(&value, &bits, sizeof(value));
++    const float converted = float(value);
++    uint32_t convertedBits;
++    std::memcpy(&convertedBits, &converted, sizeof(convertedBits));
++
++    const uint64_t exponent = (bits >> 52) & 0x7FF;
++    const uint64_t significand = (bits & 0xFFFFFFFFFFFFFull) | (uint64_t(exponent != 0) << 52);
++    const int64_t rawShift = 926 - int64_t(exponent + (exponent == 0));
++    const int64_t lowShift = rawShift + ((30 - rawShift) & -int64_t(rawShift < 30));
++    const unsigned shift = unsigned(lowShift - ((lowShift - 63) & -int64_t(lowShift > 63)));
++    const uint64_t integer = significand >> shift;
++    const uint64_t remainder = significand & ((uint64_t(1) << shift) - 1);
++    const uint64_t half = uint64_t(1) << (shift - 1);
++    const uint64_t sign = bits >> 63;
++    const uint32_t mode = (csr >> 22) & 3;
++    const uint64_t inexact = remainder != 0;
++    const uint64_t nearestUp = (remainder > half) | ((remainder == half) & (integer & 1));
++    const uint64_t up = (nearestUp & (mode == 0)) | (inexact & (mode == 1) & (sign ^ 1)) | (inexact & (mode == 2) & sign);
++    const uint32_t tinyBits = uint32_t(sign << 31) | uint32_t(integer + up);
++    const uint32_t tiny = -uint32_t(exponent < 897);
++    return (convertedBits & ~tiny) | (tinyBits & tiny);
++}
++
  // SSE3 constants are missing from simde
  #ifndef _MM_DENORMALS_ZERO_MASK
  #define _MM_DENORMALS_ZERO_MASK 0x0040
-@@ -31,74 +102,95 @@
+@@ -31,74 +177,134 @@
  
  #define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
  
@@ -820,8 +1769,32 @@ index 31a86cd..4982be7 100644
 +#define PPC_GUEST_MEMORY
 +#endif
 +
++// [Switch] Round 11, SWITCH_NARROW_BARRIER (PPC_CONFIG_NARROW_BARRIER, from tools/switch-codegen-pass.py): the barrier
++// says it reads and writes every byte of guest memory, so every guest load and store is still issued again and kept
++// in order across it, and wait loops still see other threads' stores; but it no longer covers the PPCContext (host
++// memory that only its own thread uses), whose registers then stay in registers through a loop. The pass keeps
++// PPC_LOOP_BARRIER_FULL in functions with double-precision or vector floating-point arithmetic (see there).
++#define PPC_LOOP_BARRIER_FULL() __asm__ __volatile__("" ::: "memory")
 +#ifndef PPC_LOOP_BARRIER
-+#define PPC_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")
++#ifdef PPC_CONFIG_NARROW_BARRIER
++#define PPC_LOOP_BARRIER() __asm__ __volatile__("" : "+m"(*(uint8_t (*)[0x100000000ull])base))
++#else
++#define PPC_LOOP_BARRIER() PPC_LOOP_BARRIER_FULL()
++#endif
++#endif
++
++// [Switch] Round 13: the game's data cache touch hints (dcbt, dcbtst) as host prefetches of the same guest address.
++// They change no value and no order: a prefetch is only a hint, it never faults (on any address) and GCC does not
++// treat it as a memory access. XenonRecomp emitted nothing for them before, so the prefetches the game's programmers
++// placed (the render walk's next group and next mesh, the D3D constant setters' source rows...) were lost.
++#ifndef PPC_PREFETCH
++#if defined(__GNUC__) || defined(__clang__)
++#define PPC_PREFETCH(x) __builtin_prefetch(base + uint32_t(x), 0)
++#define PPC_PREFETCH_STORE(x) __builtin_prefetch(base + uint32_t(x), 1)
++#else
++#define PPC_PREFETCH(x) ((void)0)
++#define PPC_PREFETCH_STORE(x) ((void)0)
++#endif
 +#endif
 +
  #ifndef PPC_LOAD_U8
@@ -890,6 +1863,21 @@ index 31a86cd..4982be7 100644
 +#define PPC_STORE_U64(x, y) *(PPC_GUEST_MEMORY uint64_t*)(base + (x)) = __builtin_bswap64(y)
  #endif
  
++// [Switch] Round 11, SWITCH_WIDE_DFORM (tools/switch-codegen-pass.py): a load or store at register + displacement
++// (the D form, with a register: not RA=0) as a 64-bit address, so the compiler adds the register to base once
++// and folds the displacements into the accesses (and pairs neighbours). It differs from the 32-bit sum only when
++// that sum wraps past 4 GB: only for a displacement of 0 to 4095 (or any from r1, the stack, which never sits near
++// either end) is the form used, where the wrapped address is in guest page 0, never mapped, and the unwrapped one
++// in the guard page reserved after the 4 GB (kernel/memory.cpp): both fault.
++#define PPC_LOAD_U8_D(r, d) *(PPC_GUEST_MEMORY uint8_t*)(base + uint64_t(uint32_t(r)) + int64_t(d))
++#define PPC_LOAD_U16_D(r, d) __builtin_bswap16(*(PPC_GUEST_MEMORY uint16_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)))
++#define PPC_LOAD_U32_D(r, d) __builtin_bswap32(*(PPC_GUEST_MEMORY uint32_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)))
++#define PPC_LOAD_U64_D(r, d) __builtin_bswap64(*(PPC_GUEST_MEMORY uint64_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)))
++#define PPC_STORE_U8_D(r, d, y) *(PPC_GUEST_MEMORY uint8_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)) = (y)
++#define PPC_STORE_U16_D(r, d, y) *(PPC_GUEST_MEMORY uint16_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)) = __builtin_bswap16(y)
++#define PPC_STORE_U32_D(r, d, y) *(PPC_GUEST_MEMORY uint32_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)) = __builtin_bswap32(y)
++#define PPC_STORE_U64_D(r, d, y) *(PPC_GUEST_MEMORY uint64_t*)(base + uint64_t(uint32_t(r)) + int64_t(d)) = __builtin_bswap64(y)
++
  // MMIO Store handling is completely reliant on being preeceded by eieio.
  // TODO: Verify if that's always the case.
  #ifndef PPC_MM_STORE_U8
@@ -913,7 +1901,157 @@ index 31a86cd..4982be7 100644
  #endif
  
  #ifndef PPC_CALL_FUNC
-@@ -692,9 +784,15 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
+@@ -164,6 +370,40 @@ struct PPCCRRegister
+         so = xer.so;
+     }
+ 
++    // [Switch] Round 14 (XENON_RECOMP_FEWER_MODE_SWITCHES): fcmpu between VMX instructions, which run with FPCR.FZ set,
++    // where a compare would take a denormal operand for a zero. The same four bits as compare(double, double) without
++    // FZ, from the bit patterns: a NaN is unordered; otherwise sign and magnitude become a two's complement key, in
++    // which +0 and -0 are both 0 and the order is the numbers' order. No branch.
++    __attribute__((always_inline)) inline void compareBits(uint64_t left, uint64_t right) noexcept
++    {
++        constexpr uint64_t Magnitude = 0x7FFFFFFFFFFFFFFFull;
++        constexpr uint64_t Infinity = 0x7FF0000000000000ull;
++        const uint64_t leftMagnitude = left & Magnitude;
++        const uint64_t rightMagnitude = right & Magnitude;
++        const bool unordered = (leftMagnitude > Infinity) | (rightMagnitude > Infinity);
++        const int64_t leftSign = -int64_t(left >> 63);
++        const int64_t rightSign = -int64_t(right >> 63);
++        const int64_t leftKey = (int64_t(leftMagnitude) ^ leftSign) - leftSign;
++        const int64_t rightKey = (int64_t(rightMagnitude) ^ rightSign) - rightSign;
++        un = unordered;
++        lt = !unordered & (leftKey < rightKey);
++        gt = !unordered & (leftKey > rightKey);
++        eq = !unordered & (leftKey == rightKey);
++    }
++
++#ifdef PPC_CONFIG_INLINE_FP_COMPARE
++    // [Switch] Round 12, SWITCH_INLINE_FP_COMPARE (tools/switch-codegen-pass.py): the same four bits from one quiet
++    // comparison (isless and isgreater are false for unordered operands, as == is), and always inlined. GCC kept the
++    // version below out of line at 11,669 fcmpu sites once the unit had grown past its inlining budget: each such site
++    // was a call that left the CR field in memory for the branch to read back, and spilled live floating-point registers.
++    __attribute__((always_inline)) inline void compare(double left, double right) noexcept
++    {
++        un = __builtin_isunordered(left, right);
++        lt = __builtin_isless(left, right);
++        gt = __builtin_isgreater(left, right);
++        eq = left == right;
++    }
++#else
+     inline void compare(double left, double right) noexcept
+     {
+         un = __builtin_isnan(left) || __builtin_isnan(right);
+@@ -171,6 +411,7 @@ struct PPCCRRegister
+         gt = !un && (left > right);
+         eq = !un && (left == right);
+     }
++#endif
+ 
+     inline void setFromMask(simde__m128 mask, int imm) noexcept
+     {
+@@ -624,6 +865,100 @@ inline uint8_t VectorShiftTableR[] =
+     0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+ };
+ 
++// [Switch] Round 11, SWITCH_CONST_VMX_TABLES (PPC_CONFIG_CONST_VMX_TABLES, from tools/switch-codegen-pass.py): constant
++// copies of the tables, which the code the pass rewrites uses instead (the rest keeps the tables above, so its code
++// stays exactly as it was). Constants let the compiler fold them; and lvx/stvx/lvlx/lvrx's byte shuffles with
++// VectorMaskL/R (every index 0x00-0x0F or 0xFF) become a plain NEON TBL, which gives 0 for an index of 16 or more
++// exactly as the x86 shuffle's sign bit does (simde masks the index with 0x8F for that). The shift tables hold
++// 0x10-0x1F and are vperm controls: never shuffled this way.
++#ifdef PPC_CONFIG_CONST_VMX_TABLES
++alignas(16) inline constexpr uint8_t VectorMaskLConst[] =
++{
++    0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
++    0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
++    0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
++    0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
++    0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E, 0x0D,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0E,
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
++};
++
++alignas(16) inline constexpr uint8_t VectorMaskRConst[] =
++{
++    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
++    0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0xFF,
++    0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF, 0xFF,
++    0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF,
++};
++
++alignas(16) inline constexpr uint8_t VectorShiftTableLConst[] =
++{
++    0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
++    0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
++    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
++    0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
++    0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
++    0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05,
++    0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06,
++    0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07,
++    0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
++    0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09,
++    0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
++    0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B,
++    0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C,
++    0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D,
++    0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E,
++    0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
++};
++
++alignas(16) inline constexpr uint8_t VectorShiftTableRConst[] =
++{
++    0x1F, 0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10,
++    0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
++    0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E,
++    0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D,
++    0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C,
++    0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B,
++    0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
++    0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09,
++    0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
++    0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07,
++    0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06,
++    0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05,
++    0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04,
++    0x12, 0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
++    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
++    0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
++};
++
++#if defined(__aarch64__)
++#define PPC_VECTOR_TABLE(a, index) simde__m128i_from_neon_u8(vqtbl1q_u8(simde__m128i_to_neon_u8(a), simde__m128i_to_neon_u8(index)))
++#else
++#define PPC_VECTOR_TABLE(a, index) simde_mm_shuffle_epi8(a, index)
++#endif
++#endif
++
+ inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b)
+ {
+     return simde_mm_add_epi32(a, simde_mm_min_epu32(simde_mm_xor_si128(a, simde_mm_cmpeq_epi32(a, a)), b));
+@@ -692,9 +1027,15 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
  inline uint64_t __rdtsc()
  {
      uint64_t ret;
@@ -930,13 +2068,253 @@ index 31a86cd..4982be7 100644
  #elif !defined(__x86_64__) && !defined(_M_X64)
  #   error "Missing implementation for __rdtsc()"
 diff --git a/XenonUtils/xbox.h b/XenonUtils/xbox.h
-index 0361b0f..0b3d098 100644
+index 0361b0f..b14290d 100644
 --- a/XenonUtils/xbox.h
 +++ b/XenonUtils/xbox.h
-@@ -241,20 +241,8 @@ typedef struct _XOVERLAPPED {
- 
- // this name is so dumb
- typedef struct _XXOVERLAPPED {
+@@ -1,409 +1,397 @@
+-#pragma once
+-#include <cstdint>
+-#include <type_traits>
+-#include <bit>
+-#include <string>
+-#include "byteswap.h"
+-
+-#ifdef _WIN32
+-    #include <windows.h>
+-#endif
+-
+-// real win32 handles will never use the upper bits unless something goes really wrong
+-#define CHECK_GUEST_HANDLE(HANDLE) (((HANDLE) & 0x80000000) == 0x80000000)
+-#define GUEST_HANDLE(HANDLE) ((HANDLE) | 0x80000000)
+-#define HOST_HANDLE(HANDLE) ((HANDLE) & ~0x80000000)
+-
+-// Return true to free the associated memory
+-typedef bool(*TypeDestructor_t)(void*);
+-
+-template<typename T>
+-bool DestroyObject(void* obj)
+-{
+-    static_cast<T*>(obj)->~T();
+-    return true;
+-}
+-
+-template<typename T>
+-struct be
+-{
+-    T value;
+-
+-    be() : value(0)
+-    {
+-    }
+-
+-    be(const T v)
+-    {
+-        set(v);
+-    }
+-
+-    static T byteswap(T value)
+-    {
+-        if constexpr (std::is_same_v<T, double>)
+-        {
+-            const uint64_t swapped = ByteSwap(*reinterpret_cast<uint64_t*>(&value));
+-            return *reinterpret_cast<const T*>(&swapped);
+-        }
+-        else if constexpr (std::is_same_v<T, float>)
+-        {
+-            const uint32_t swapped = ByteSwap(*reinterpret_cast<uint32_t*>(&value));
+-            return *reinterpret_cast<const T*>(&swapped);
+-        }
+-        else if constexpr (std::is_enum_v<T>)
+-        {
+-            const std::underlying_type_t<T> swapped = ByteSwap(*reinterpret_cast<std::underlying_type_t<T>*>(&value));
+-            return *reinterpret_cast<const T*>(&swapped);
+-        }
+-        else
+-        {
+-            return ByteSwap(value);
+-        }
+-    }
+-
+-    void set(const T v)
+-    {
+-        value = byteswap(v);
+-    }
+-
+-    T get() const
+-    {
+-        return byteswap(value);
+-    }
+-
+-    be& operator| (T value)
+-    {
+-        set(get() | value);
+-        return *this;
+-    }
+-
+-    be& operator& (T value)
+-    {
+-        set(get() & value);
+-        return *this;
+-    }
+-
+-    operator T() const
+-    {
+-        return get();
+-    }
+-
+-    be& operator=(T v)
+-    {
+-        set(v);
+-        return *this;
+-    }
+-};
+-
+-extern "C" void* MmGetHostAddress(uint32_t ptr);
+-template<typename T>
+-struct xpointer
+-{
+-    be<uint32_t> ptr;
+-
+-    xpointer() : ptr(0)
+-    {
+-    }
+-
+-    xpointer(T* p) : ptr(p != nullptr ? (reinterpret_cast<size_t>(p) - reinterpret_cast<size_t>(MmGetHostAddress(0))) : 0)
+-    {
+-    }
+-
+-    T* get() const
+-    {
+-        if (!ptr.value)
+-        {
+-            return nullptr;
+-        }
+-
+-        return reinterpret_cast<T*>(MmGetHostAddress(ptr));
+-    }
+-
+-    operator T* () const
+-    {
+-        return get();
+-    }
+-
+-    T* operator->() const
+-    {
+-        return get();
+-    }
+-};
+-
+-template<typename TGuest>
+-struct HostObject
+-{
+-    typedef TGuest guest_type;
+-};
+-
+-struct _XLIST_ENTRY;
+-typedef _XLIST_ENTRY XLIST_ENTRY;
+-typedef xpointer<XLIST_ENTRY> PXLIST_ENTRY;
+-
+-typedef struct _IMAGE_CE_RUNTIME_FUNCTION
+-{
+-    uint32_t BeginAddress;
+-
+-    union 
+-    {
+-        uint32_t Data;
+-        struct
+-        {
+-            uint32_t PrologLength : 8;
+-            uint32_t FunctionLength : 22;
+-            uint32_t ThirtyTwoBit : 1;
+-            uint32_t ExceptionFlag : 1;
+-        };
+-    };
+-} IMAGE_CE_RUNTIME_FUNCTION;
+-
+-static_assert(sizeof(IMAGE_CE_RUNTIME_FUNCTION) == 8);
+-
+-typedef struct _XLIST_ENTRY
+-{
+-    be<uint32_t> Flink;
+-    be<uint32_t> Blink;
+-} XLIST_ENTRY;
+-
+-typedef struct _XDISPATCHER_HEADER
+-{
+-    union
+-    {
+-        struct
+-        {
+-            uint8_t Type;
+-            union
+-            {
+-                uint8_t Abandoned;
+-                uint8_t Absolute;
+-                uint8_t NpxIrql;
+-                uint8_t Signalling;
+-            };
+-            union
+-            {
+-                uint8_t Size;
+-                uint8_t Hand;
+-            };
+-            union
+-            {
+-                uint8_t Inserted;
+-                uint8_t DebugActive;
+-                uint8_t DpcActive;
+-            };
+-        };
+-        be<uint32_t> Lock;
+-    };
+-
+-    be<uint32_t> SignalState;
+-    XLIST_ENTRY WaitListHead;
+-} XDISPATCHER_HEADER, * XPDISPATCHER_HEADER;
+-
+-// These variables are never accessed in guest code, we can safely use them in little endian
+-typedef struct _XRTL_CRITICAL_SECTION
+-{
+-    XDISPATCHER_HEADER Header;
+-    int32_t LockCount;
+-    int32_t RecursionCount;
+-    uint32_t OwningThread;
+-} XRTL_CRITICAL_SECTION;
+-
+-typedef struct _XANSI_STRING {
+-    be<uint16_t> Length;
+-    be<uint16_t> MaximumLength;
+-    xpointer<char> Buffer;
+-} XANSI_STRING;
+-
+-typedef struct _XOBJECT_ATTRIBUTES
+-{
+-    be<uint32_t> RootDirectory;
+-    xpointer<XANSI_STRING> Name;
+-    xpointer<void> Attributes;
+-} XOBJECT_ATTRIBUTES;
+-
+-typedef XDISPATCHER_HEADER XKEVENT;
+-
+-typedef struct _XIO_STATUS_BLOCK
+-{
+-    union {
+-        be<uint32_t> Status;
+-        be<uint32_t> Pointer;
+-    };
+-    be<uint32_t> Information;
+-} XIO_STATUS_BLOCK;
+-
+-typedef struct _XOVERLAPPED {
+-    be<uint32_t> Internal;
+-    be<uint32_t> InternalHigh;
+-    be<uint32_t> Offset;
+-    be<uint32_t> OffsetHigh;
+-    be<uint32_t> hEvent;
+-} XOVERLAPPED;
+-
+-// this name is so dumb
+-typedef struct _XXOVERLAPPED {
 -    union
 -    {
 -        struct
@@ -951,19 +2329,893 @@ index 0361b0f..0b3d098 100644
 -            uint32_t InternalHigh;
 -        };
 -    };
+-    uint32_t InternalContext;
+-    be<uint32_t> hEvent;
+-    be<uint32_t> pCompletionRoutine;
+-    be<uint32_t> dwCompletionContext;
+-    be<uint32_t> dwExtendedError;
+-} XXOVERLAPPED, *PXXOVERLAPPED;
+-
+-static_assert(sizeof(_XXOVERLAPPED) == 0x1C);
+-
+-// https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-memorystatus
+-typedef struct _XMEMORYSTATUS {
+-    be<uint32_t> dwLength;
+-    be<uint32_t> dwMemoryLoad;
+-    be<uint32_t> dwTotalPhys;
+-    be<uint32_t> dwAvailPhys;
+-    be<uint32_t> dwTotalPageFile;
+-    be<uint32_t> dwAvailPageFile;
+-    be<uint32_t> dwTotalVirtual;
+-    be<uint32_t> dwAvailVirtual;
+-} XMEMORYSTATUS, * XLPMEMORYSTATUS;
+-
+-typedef struct _XVIDEO_MODE
+-{
+-    be<uint32_t> DisplayWidth;
+-    be<uint32_t> DisplayHeight;
+-    be<uint32_t> IsInterlaced;
+-    be<uint32_t> IsWidescreen;
+-    be<uint32_t> IsHighDefinition;
+-    be<uint32_t> RefreshRate;
+-    be<uint32_t> VideoStandard;
+-    be<uint32_t> Unknown4A;
+-    be<uint32_t> Unknown01;
+-    be<uint32_t> reserved[3];
+-} XVIDEO_MODE;
+-
+-typedef struct _XKSEMAPHORE
+-{
+-    XDISPATCHER_HEADER Header;
+-    be<uint32_t> Limit;
+-} XKSEMAPHORE;
+-
+-typedef struct _XUSER_SIGNIN_INFO {
+-    be<uint64_t> xuid;
+-    be<uint32_t> dwField08;
+-    be<uint32_t> SigninState;
+-    be<uint32_t> dwField10;
+-    be<uint32_t> dwField14;
+-    char Name[16];
+-} XUSER_SIGNIN_INFO;
+-
+-typedef struct _XTIME_FIELDS
+-{
+-    be<uint16_t> Year;
+-    be<uint16_t> Month;
+-    be<uint16_t> Day;
+-    be<uint16_t> Hour;
+-    be<uint16_t> Minute;
+-    be<uint16_t> Second;
+-    be<uint16_t> Milliseconds;
+-    be<uint16_t> Weekday;
+-} XTIME_FIELDS, * PXTIME_FIELDS;
+-
+-// Content types
+-#define XCONTENTTYPE_SAVEDATA 1
+-#define XCONTENTTYPE_DLC      2
+-#define XCONTENTTYPE_RESERVED 3
+-
+-#define XCONTENT_NEW      1
+-#define XCONTENT_EXISTING 2
+-
+-#define XCONTENT_MAX_DISPLAYNAME 128
+-#define XCONTENT_MAX_FILENAME    42
+-#define XCONTENTDEVICE_MAX_NAME  27
+-
+-typedef struct _XCONTENT_DATA
+-{
+-    be<uint32_t> DeviceID;
+-    be<uint32_t> dwContentType;
+-    be<uint16_t> szDisplayName[XCONTENT_MAX_DISPLAYNAME];
+-    char szFileName[XCONTENT_MAX_FILENAME];
+-} XCONTENT_DATA, * PXCONTENT_DATA;
+-
+-typedef struct _XHOSTCONTENT_DATA : _XCONTENT_DATA
+-{
+-    // This is a host exclusive type so we don't care what goes on
+-    std::string szRoot{};
+-} XHOSTCONTENT_DATA, *PXHOSTCONTENT_DATA;
+-
+-
+-#define XCONTENTDEVICETYPE_HDD 1
+-#define XCONTENTDEVICETYPE_MU 2
+-
+-typedef struct _XDEVICE_DATA
+-{
+-    be<uint32_t> DeviceID;
+-    be<uint32_t> DeviceType;
+-    be<uint64_t> ulDeviceBytes;
+-    be<uint64_t> ulDeviceFreeBytes;
+-    be<uint16_t> wszName[XCONTENTDEVICE_MAX_NAME];
+-} XDEVICE_DATA, *PXDEVICE_DATA;
+-
+-// Direct reflection of XInput structures
+-
+-#define XAMINPUT_DEVTYPE_GAMEPAD          0x01
+-#define XAMINPUT_DEVSUBTYPE_GAMEPAD       0x01
+-
+-#define XAMINPUT_GAMEPAD_DPAD_UP          0x0001
+-#define XAMINPUT_GAMEPAD_DPAD_DOWN        0x0002
+-#define XAMINPUT_GAMEPAD_DPAD_LEFT        0x0004
+-#define XAMINPUT_GAMEPAD_DPAD_RIGHT       0x0008
+-#define XAMINPUT_GAMEPAD_START            0x0010
+-#define XAMINPUT_GAMEPAD_BACK             0x0020
+-#define XAMINPUT_GAMEPAD_LEFT_THUMB       0x0040
+-#define XAMINPUT_GAMEPAD_RIGHT_THUMB      0x0080
+-#define XAMINPUT_GAMEPAD_LEFT_SHOULDER    0x0100
+-#define XAMINPUT_GAMEPAD_RIGHT_SHOULDER   0x0200
+-#define XAMINPUT_GAMEPAD_A                0x1000
+-#define XAMINPUT_GAMEPAD_B                0x2000
+-#define XAMINPUT_GAMEPAD_X                0x4000
+-#define XAMINPUT_GAMEPAD_Y                0x8000
+-
+-typedef struct _XAMINPUT_GAMEPAD
+-{
+-    uint16_t                            wButtons;
+-    uint8_t                             bLeftTrigger;
+-    uint8_t                             bRightTrigger;
+-    int16_t                             sThumbLX;
+-    int16_t                             sThumbLY;
+-    int16_t                             sThumbRX;
+-    int16_t                             sThumbRY;
+-} XAMINPUT_GAMEPAD, *PXAMINPUT_GAMEPAD;
+-
+-typedef struct _XAMINPUT_VIBRATION
+-{
+-    uint16_t                            wLeftMotorSpeed;
+-    uint16_t                            wRightMotorSpeed;
+-} XAMINPUT_VIBRATION, * PXAMINPUT_VIBRATION;
+-
+-typedef struct _XAMINPUT_CAPABILITIES
+-{
+-    uint8_t                             Type;
+-    uint8_t                             SubType;
+-    uint16_t                            Flags;
+-    XAMINPUT_GAMEPAD                    Gamepad;
+-    XAMINPUT_VIBRATION                  Vibration;
+-} XAMINPUT_CAPABILITIES, * PXAMINPUT_CAPABILITIES;
+-
+-typedef struct _XAMINPUT_STATE
+-{
+-    uint32_t                            dwPacketNumber;
+-    XAMINPUT_GAMEPAD                    Gamepad;
+-} XAMINPUT_STATE, * PXAMINPUT_STATE;
++#pragma once
++#include <cstdint>
++#include <type_traits>
++#include <bit>
++#include <string>
++#include "byteswap.h"
++
++#ifdef _WIN32
++    #include <windows.h>
++#endif
++
++// real win32 handles will never use the upper bits unless something goes really wrong
++#define CHECK_GUEST_HANDLE(HANDLE) (((HANDLE) & 0x80000000) == 0x80000000)
++#define GUEST_HANDLE(HANDLE) ((HANDLE) | 0x80000000)
++#define HOST_HANDLE(HANDLE) ((HANDLE) & ~0x80000000)
++
++// Return true to free the associated memory
++typedef bool(*TypeDestructor_t)(void*);
++
++template<typename T>
++bool DestroyObject(void* obj)
++{
++    static_cast<T*>(obj)->~T();
++    return true;
++}
++
++template<typename T>
++struct be
++{
++    T value;
++
++    be() : value(0)
++    {
++    }
++
++    be(const T v)
++    {
++        set(v);
++    }
++
++    static T byteswap(T value)
++    {
++        if constexpr (std::is_same_v<T, double>)
++        {
++            const uint64_t swapped = ByteSwap(*reinterpret_cast<uint64_t*>(&value));
++            return *reinterpret_cast<const T*>(&swapped);
++        }
++        else if constexpr (std::is_same_v<T, float>)
++        {
++            const uint32_t swapped = ByteSwap(*reinterpret_cast<uint32_t*>(&value));
++            return *reinterpret_cast<const T*>(&swapped);
++        }
++        else if constexpr (std::is_enum_v<T>)
++        {
++            const std::underlying_type_t<T> swapped = ByteSwap(*reinterpret_cast<std::underlying_type_t<T>*>(&value));
++            return *reinterpret_cast<const T*>(&swapped);
++        }
++        else
++        {
++            return ByteSwap(value);
++        }
++    }
++
++    void set(const T v)
++    {
++        value = byteswap(v);
++    }
++
++    T get() const
++    {
++        return byteswap(value);
++    }
++
++    be& operator| (T value)
++    {
++        set(get() | value);
++        return *this;
++    }
++
++    be& operator& (T value)
++    {
++        set(get() & value);
++        return *this;
++    }
++
++    operator T() const
++    {
++        return get();
++    }
++
++    be& operator=(T v)
++    {
++        set(v);
++        return *this;
++    }
++};
++
++extern "C" void* MmGetHostAddress(uint32_t ptr);
++template<typename T>
++struct xpointer
++{
++    be<uint32_t> ptr;
++
++    xpointer() : ptr(0)
++    {
++    }
++
++    xpointer(T* p) : ptr(p != nullptr ? (reinterpret_cast<size_t>(p) - reinterpret_cast<size_t>(MmGetHostAddress(0))) : 0)
++    {
++    }
++
++    T* get() const
++    {
++        if (!ptr.value)
++        {
++            return nullptr;
++        }
++
++        return reinterpret_cast<T*>(MmGetHostAddress(ptr));
++    }
++
++    operator T* () const
++    {
++        return get();
++    }
++
++    T* operator->() const
++    {
++        return get();
++    }
++};
++
++template<typename TGuest>
++struct HostObject
++{
++    typedef TGuest guest_type;
++};
++
++struct _XLIST_ENTRY;
++typedef _XLIST_ENTRY XLIST_ENTRY;
++typedef xpointer<XLIST_ENTRY> PXLIST_ENTRY;
++
++typedef struct _IMAGE_CE_RUNTIME_FUNCTION
++{
++    uint32_t BeginAddress;
++
++    union 
++    {
++        uint32_t Data;
++        struct
++        {
++            uint32_t PrologLength : 8;
++            uint32_t FunctionLength : 22;
++            uint32_t ThirtyTwoBit : 1;
++            uint32_t ExceptionFlag : 1;
++        };
++    };
++} IMAGE_CE_RUNTIME_FUNCTION;
++
++static_assert(sizeof(IMAGE_CE_RUNTIME_FUNCTION) == 8);
++
++typedef struct _XLIST_ENTRY
++{
++    be<uint32_t> Flink;
++    be<uint32_t> Blink;
++} XLIST_ENTRY;
++
++typedef struct _XDISPATCHER_HEADER
++{
++    union
++    {
++        struct
++        {
++            uint8_t Type;
++            union
++            {
++                uint8_t Abandoned;
++                uint8_t Absolute;
++                uint8_t NpxIrql;
++                uint8_t Signalling;
++            };
++            union
++            {
++                uint8_t Size;
++                uint8_t Hand;
++            };
++            union
++            {
++                uint8_t Inserted;
++                uint8_t DebugActive;
++                uint8_t DpcActive;
++            };
++        };
++        be<uint32_t> Lock;
++    };
++
++    be<uint32_t> SignalState;
++    XLIST_ENTRY WaitListHead;
++} XDISPATCHER_HEADER, * XPDISPATCHER_HEADER;
++
++// These variables are never accessed in guest code, we can safely use them in little endian
++typedef struct _XRTL_CRITICAL_SECTION
++{
++    XDISPATCHER_HEADER Header;
++    int32_t LockCount;
++    int32_t RecursionCount;
++    uint32_t OwningThread;
++} XRTL_CRITICAL_SECTION;
++
++typedef struct _XANSI_STRING {
++    be<uint16_t> Length;
++    be<uint16_t> MaximumLength;
++    xpointer<char> Buffer;
++} XANSI_STRING;
++
++typedef struct _XOBJECT_ATTRIBUTES
++{
++    be<uint32_t> RootDirectory;
++    xpointer<XANSI_STRING> Name;
++    xpointer<void> Attributes;
++} XOBJECT_ATTRIBUTES;
++
++typedef XDISPATCHER_HEADER XKEVENT;
++
++typedef struct _XIO_STATUS_BLOCK
++{
++    union {
++        be<uint32_t> Status;
++        be<uint32_t> Pointer;
++    };
++    be<uint32_t> Information;
++} XIO_STATUS_BLOCK;
++
++typedef struct _XOVERLAPPED {
++    be<uint32_t> Internal;
++    be<uint32_t> InternalHigh;
++    be<uint32_t> Offset;
++    be<uint32_t> OffsetHigh;
++    be<uint32_t> hEvent;
++} XOVERLAPPED;
++
++// this name is so dumb
++typedef struct _XXOVERLAPPED {
 +    uint32_t InternalLow;
 +    uint32_t InternalHigh;
-     uint32_t InternalContext;
-     be<uint32_t> hEvent;
-     be<uint32_t> pCompletionRoutine;
++    uint32_t InternalContext;
++    be<uint32_t> hEvent;
++    be<uint32_t> pCompletionRoutine;
++    be<uint32_t> dwCompletionContext;
++    be<uint32_t> dwExtendedError;
++} XXOVERLAPPED, *PXXOVERLAPPED;
++
++static_assert(sizeof(_XXOVERLAPPED) == 0x1C);
++
++// https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-memorystatus
++typedef struct _XMEMORYSTATUS {
++    be<uint32_t> dwLength;
++    be<uint32_t> dwMemoryLoad;
++    be<uint32_t> dwTotalPhys;
++    be<uint32_t> dwAvailPhys;
++    be<uint32_t> dwTotalPageFile;
++    be<uint32_t> dwAvailPageFile;
++    be<uint32_t> dwTotalVirtual;
++    be<uint32_t> dwAvailVirtual;
++} XMEMORYSTATUS, * XLPMEMORYSTATUS;
++
++typedef struct _XVIDEO_MODE
++{
++    be<uint32_t> DisplayWidth;
++    be<uint32_t> DisplayHeight;
++    be<uint32_t> IsInterlaced;
++    be<uint32_t> IsWidescreen;
++    be<uint32_t> IsHighDefinition;
++    be<uint32_t> RefreshRate;
++    be<uint32_t> VideoStandard;
++    be<uint32_t> Unknown4A;
++    be<uint32_t> Unknown01;
++    be<uint32_t> reserved[3];
++} XVIDEO_MODE;
++
++typedef struct _XKSEMAPHORE
++{
++    XDISPATCHER_HEADER Header;
++    be<uint32_t> Limit;
++} XKSEMAPHORE;
++
++typedef struct _XUSER_SIGNIN_INFO {
++    be<uint64_t> xuid;
++    be<uint32_t> dwField08;
++    be<uint32_t> SigninState;
++    be<uint32_t> dwField10;
++    be<uint32_t> dwField14;
++    char Name[16];
++} XUSER_SIGNIN_INFO;
++
++typedef struct _XTIME_FIELDS
++{
++    be<uint16_t> Year;
++    be<uint16_t> Month;
++    be<uint16_t> Day;
++    be<uint16_t> Hour;
++    be<uint16_t> Minute;
++    be<uint16_t> Second;
++    be<uint16_t> Milliseconds;
++    be<uint16_t> Weekday;
++} XTIME_FIELDS, * PXTIME_FIELDS;
++
++// Content types
++#define XCONTENTTYPE_SAVEDATA 1
++#define XCONTENTTYPE_DLC      2
++#define XCONTENTTYPE_RESERVED 3
++
++#define XCONTENT_NEW      1
++#define XCONTENT_EXISTING 2
++
++#define XCONTENT_MAX_DISPLAYNAME 128
++#define XCONTENT_MAX_FILENAME    42
++#define XCONTENTDEVICE_MAX_NAME  27
++
++typedef struct _XCONTENT_DATA
++{
++    be<uint32_t> DeviceID;
++    be<uint32_t> dwContentType;
++    be<uint16_t> szDisplayName[XCONTENT_MAX_DISPLAYNAME];
++    char szFileName[XCONTENT_MAX_FILENAME];
++} XCONTENT_DATA, * PXCONTENT_DATA;
++
++typedef struct _XHOSTCONTENT_DATA : _XCONTENT_DATA
++{
++    // This is a host exclusive type so we don't care what goes on
++    std::string szRoot{};
++} XHOSTCONTENT_DATA, *PXHOSTCONTENT_DATA;
++
++
++#define XCONTENTDEVICETYPE_HDD 1
++#define XCONTENTDEVICETYPE_MU 2
++
++typedef struct _XDEVICE_DATA
++{
++    be<uint32_t> DeviceID;
++    be<uint32_t> DeviceType;
++    be<uint64_t> ulDeviceBytes;
++    be<uint64_t> ulDeviceFreeBytes;
++    be<uint16_t> wszName[XCONTENTDEVICE_MAX_NAME];
++} XDEVICE_DATA, *PXDEVICE_DATA;
++
++// Direct reflection of XInput structures
++
++#define XAMINPUT_DEVTYPE_GAMEPAD          0x01
++#define XAMINPUT_DEVSUBTYPE_GAMEPAD       0x01
++
++#define XAMINPUT_GAMEPAD_DPAD_UP          0x0001
++#define XAMINPUT_GAMEPAD_DPAD_DOWN        0x0002
++#define XAMINPUT_GAMEPAD_DPAD_LEFT        0x0004
++#define XAMINPUT_GAMEPAD_DPAD_RIGHT       0x0008
++#define XAMINPUT_GAMEPAD_START            0x0010
++#define XAMINPUT_GAMEPAD_BACK             0x0020
++#define XAMINPUT_GAMEPAD_LEFT_THUMB       0x0040
++#define XAMINPUT_GAMEPAD_RIGHT_THUMB      0x0080
++#define XAMINPUT_GAMEPAD_LEFT_SHOULDER    0x0100
++#define XAMINPUT_GAMEPAD_RIGHT_SHOULDER   0x0200
++#define XAMINPUT_GAMEPAD_A                0x1000
++#define XAMINPUT_GAMEPAD_B                0x2000
++#define XAMINPUT_GAMEPAD_X                0x4000
++#define XAMINPUT_GAMEPAD_Y                0x8000
++
++typedef struct _XAMINPUT_GAMEPAD
++{
++    uint16_t                            wButtons;
++    uint8_t                             bLeftTrigger;
++    uint8_t                             bRightTrigger;
++    int16_t                             sThumbLX;
++    int16_t                             sThumbLY;
++    int16_t                             sThumbRX;
++    int16_t                             sThumbRY;
++} XAMINPUT_GAMEPAD, *PXAMINPUT_GAMEPAD;
++
++typedef struct _XAMINPUT_VIBRATION
++{
++    uint16_t                            wLeftMotorSpeed;
++    uint16_t                            wRightMotorSpeed;
++} XAMINPUT_VIBRATION, * PXAMINPUT_VIBRATION;
++
++typedef struct _XAMINPUT_CAPABILITIES
++{
++    uint8_t                             Type;
++    uint8_t                             SubType;
++    uint16_t                            Flags;
++    XAMINPUT_GAMEPAD                    Gamepad;
++    XAMINPUT_VIBRATION                  Vibration;
++} XAMINPUT_CAPABILITIES, * PXAMINPUT_CAPABILITIES;
++
++typedef struct _XAMINPUT_STATE
++{
++    uint32_t                            dwPacketNumber;
++    XAMINPUT_GAMEPAD                    Gamepad;
++} XAMINPUT_STATE, * PXAMINPUT_STATE;
 diff --git a/XenonUtils/xdbf.h b/XenonUtils/xdbf.h
-index 347ac2c..2129a9b 100644
+index 347ac2c..7bc8694 100644
 --- a/XenonUtils/xdbf.h
 +++ b/XenonUtils/xdbf.h
-@@ -128,12 +128,19 @@ struct XACHEntry
- 
- union XDBFTitleID
- {
+@@ -1,203 +1,210 @@
+-#pragma once
+-
+-#include <xbox.h>
+-
+-#define XDBF_SIGNATURE 0x58444246
+-#define XACH_SIGNATURE 0x58414348
+-
+-struct XDBFHeader
+-{
+-    be<uint32_t> Signature;
+-    be<uint32_t> Version;
+-    be<uint32_t> EntryTableLength;
+-    be<uint32_t> EntryCount;
+-    be<uint32_t> FreeSpaceTableLength;
+-    be<uint32_t> FreeSpaceTableEntryCount;
+-};
+-
+-enum EXDBFNamespace : uint16_t
+-{
+-    XDBF_SPA_NAMESPACE_METADATA = 1,
+-    XDBF_SPA_NAMESPACE_IMAGE = 2,
+-    XDBF_SPA_NAMESPACE_STRING_TABLE = 3,
+-    XDBF_GPD_NAMESPACE_ACHIEVEMENT = 1,
+-    XDBF_GPD_NAMESPACE_IMAGE = 2,
+-    XDBF_GPD_NAMESPACE_SETTING = 3,
+-    XDBF_GPD_NAMESPACE_TITLE = 4,
+-    XDBF_GPD_NAMESPACE_STRING = 5,
+-    XDBF_GPD_NAMESPACE_ACHIEVEMENT_SECURITY_GFWL = 6,
+-    XDBF_GPD_NAMESPACE_AVATAR_AWARD_360 = 6
+-};
+-
+-#pragma pack(push, 1)
+-struct XDBFEntry
+-{
+-    be<EXDBFNamespace> NamespaceID;
+-    be<uint64_t> ResourceID;
+-    be<uint32_t> Offset;
+-    be<uint32_t> Length;
+-};
+-#pragma pack(pop)
+-
+-struct XDBFFreeSpaceEntry
+-{
+-    be<uint32_t> Offset;
+-    be<uint32_t> Length;
+-};
+-
+-enum EXDBFLanguage : uint32_t
+-{
+-    XDBF_LANGUAGE_UNKNOWN = 0,
+-    XDBF_LANGUAGE_ENGLISH = 1,
+-    XDBF_LANGUAGE_JAPANESE = 2,
+-    XDBF_LANGUAGE_GERMAN = 3,
+-    XDBF_LANGUAGE_FRENCH = 4,
+-    XDBF_LANGUAGE_SPANISH = 5,
+-    XDBF_LANGUAGE_ITALIAN = 6,
+-    XDBF_LANGUAGE_KOREAN = 7,
+-    XDBF_LANGUAGE_CHINESE_TRAD = 8,
+-    XDBF_LANGUAGE_PORTUGUESE = 9,
+-    XDBF_LANGUAGE_CHINESE_SIMP = 10,
+-    XDBF_LANGUAGE_POLISH = 11,
+-    XDBF_LANGUAGE_RUSSIAN = 12,
+-    XDBF_LANGUAGE_MAX
+-};
+-
+-struct XSTCHeader
+-{
+-    be<uint32_t> Signature;
+-    be<uint32_t> Version;
+-    be<uint32_t> Size;
+-    be<EXDBFLanguage> Language;
+-};
+-
+-#pragma pack(push, 1)
+-struct XSTRHeader
+-{
+-    be<uint32_t> Signature;
+-    be<uint32_t> Version;
+-    be<uint32_t> Size;
+-    be<uint16_t> StringCount;
+-};
+-#pragma pack(pop)
+-
+-struct XSTREntry
+-{
+-    be<uint16_t> ID;
+-    be<uint16_t> Length;
+-};
+-
+-#pragma pack(push, 1)
+-struct XACHHeader
+-{
+-    be<uint32_t> Signature;
+-    be<uint32_t> Version;
+-    be<uint32_t> Size;
+-    be<uint16_t> AchievementCount;
+-};
+-#pragma pack(pop)
+-
+-enum EXACHFlags : uint32_t
+-{
+-    XACH_TYPE_COMPLETION = 1U,
+-    XACH_TYPE_LEVELING = 2U,
+-    XACH_TYPE_UNLOCK = 3U,
+-    XACH_TYPE_EVENT = 4U,
+-    XACH_TYPE_TOURNAMENT = 5U,
+-    XACH_TYPE_CHECKPOINT = 6U,
+-    XACH_TYPE_OTHER = 7U,
+-    XACH_TYPE_MASK = 7U,
+-    XACH_STATUS_UNACHIEVED = (1U << 4),
+-    XACH_STATUS_EARNED_ONLINE = (1U << 16),
+-    XACH_STATUS_EARNED = (1U << 17),
+-    XACH_STATUS_EDITED = (1U << 20)
+-};
+-
+-struct XACHEntry
+-{
+-    be<uint16_t> AchievementID;
+-    be<uint16_t> NameID;
+-    be<uint16_t> UnlockedDescID;
+-    be<uint16_t> LockedDescID;
+-    be<uint32_t> ImageID;
+-    be<uint16_t> Gamerscore;
+-    char pad0[0x02];
+-    be<EXACHFlags> Flags;
+-    char pad1[0x10];
+-};
+-
+-union XDBFTitleID
+-{
+-    struct
+-    {
+-        be<uint16_t> u16;
+-        char u8[0x02];
+-    };
+-
+-    be<uint32_t> u32;
+-};
+-
+-struct XDBFTitleVersion
+-{
+-    be<uint16_t> Major;
+-    be<uint16_t> Minor;
+-    be<uint16_t> Build;
+-    be<uint16_t> Revision;
+-};
+-
+-enum EXDBFTitleType : uint32_t
+-{
+-    XDBF_TITLE_TYPE_SYSTEM = 0,
+-    XDBF_TITLE_TYPE_FULL = 1,
+-    XDBF_TITLE_TYPE_DEMO = 2,
+-    XDBF_TITLE_TYPE_DOWNLOAD = 3
+-};
+-
+-struct XTHDHeader
+-{
+-    be<uint32_t> Signature;
+-    be<uint32_t> Version;
+-    be<uint32_t> Size;
+-    XDBFTitleID TitleID;
+-    be<EXDBFTitleType> Type;
+-    XDBFTitleVersion TitleVersion;
+-    char pad0[0x10];
+-};
+-
+-#pragma pack(push, 1)
+-struct XGAAHeader
+-{
+-    be<uint32_t> Signature;
+-    be<uint32_t> Version;
+-    be<uint32_t> Size;
+-    be<uint16_t> Count;
+-};
+-#pragma pack(pop)
+-
+-struct XGAAEntry
+-{
+-    char pad0[0x04];
+-    be<uint16_t> AvatarAwardID;
+-    char pad1[0x06];
+-    XDBFTitleID TitleID;
+-    be<uint16_t> NameID;
+-    be<uint16_t> UnlockedDescID;
+-    be<uint16_t> LockedDescID;
+-    char pad2[0x02];
+-    be<uint32_t> ImageID;
+-    char pad3[0x08];
+-};
+-
+-struct XSRCHeader
+-{
+-    be<uint32_t> Signature;
+-    be<uint32_t> Version;
+-    be<uint32_t> Size;
+-    be<uint32_t> FileNameLength;
+-};
+-
+-struct XSRCHeader2
+-{
+-    be<uint32_t> UncompressedSize;
+-    be<uint32_t> CompressedSize;
+-};
++#pragma once
++
++#include <xbox.h>
++
++#define XDBF_SIGNATURE 0x58444246
++#define XACH_SIGNATURE 0x58414348
++
++struct XDBFHeader
++{
++    be<uint32_t> Signature;
++    be<uint32_t> Version;
++    be<uint32_t> EntryTableLength;
++    be<uint32_t> EntryCount;
++    be<uint32_t> FreeSpaceTableLength;
++    be<uint32_t> FreeSpaceTableEntryCount;
++};
++
++enum EXDBFNamespace : uint16_t
++{
++    XDBF_SPA_NAMESPACE_METADATA = 1,
++    XDBF_SPA_NAMESPACE_IMAGE = 2,
++    XDBF_SPA_NAMESPACE_STRING_TABLE = 3,
++    XDBF_GPD_NAMESPACE_ACHIEVEMENT = 1,
++    XDBF_GPD_NAMESPACE_IMAGE = 2,
++    XDBF_GPD_NAMESPACE_SETTING = 3,
++    XDBF_GPD_NAMESPACE_TITLE = 4,
++    XDBF_GPD_NAMESPACE_STRING = 5,
++    XDBF_GPD_NAMESPACE_ACHIEVEMENT_SECURITY_GFWL = 6,
++    XDBF_GPD_NAMESPACE_AVATAR_AWARD_360 = 6
++};
++
++#pragma pack(push, 1)
++struct XDBFEntry
++{
++    be<EXDBFNamespace> NamespaceID;
++    be<uint64_t> ResourceID;
++    be<uint32_t> Offset;
++    be<uint32_t> Length;
++};
++#pragma pack(pop)
++
++struct XDBFFreeSpaceEntry
++{
++    be<uint32_t> Offset;
++    be<uint32_t> Length;
++};
++
++enum EXDBFLanguage : uint32_t
++{
++    XDBF_LANGUAGE_UNKNOWN = 0,
++    XDBF_LANGUAGE_ENGLISH = 1,
++    XDBF_LANGUAGE_JAPANESE = 2,
++    XDBF_LANGUAGE_GERMAN = 3,
++    XDBF_LANGUAGE_FRENCH = 4,
++    XDBF_LANGUAGE_SPANISH = 5,
++    XDBF_LANGUAGE_ITALIAN = 6,
++    XDBF_LANGUAGE_KOREAN = 7,
++    XDBF_LANGUAGE_CHINESE_TRAD = 8,
++    XDBF_LANGUAGE_PORTUGUESE = 9,
++    XDBF_LANGUAGE_CHINESE_SIMP = 10,
++    XDBF_LANGUAGE_POLISH = 11,
++    XDBF_LANGUAGE_RUSSIAN = 12,
++    XDBF_LANGUAGE_MAX
++};
++
++struct XSTCHeader
++{
++    be<uint32_t> Signature;
++    be<uint32_t> Version;
++    be<uint32_t> Size;
++    be<EXDBFLanguage> Language;
++};
++
++#pragma pack(push, 1)
++struct XSTRHeader
++{
++    be<uint32_t> Signature;
++    be<uint32_t> Version;
++    be<uint32_t> Size;
++    be<uint16_t> StringCount;
++};
++#pragma pack(pop)
++
++struct XSTREntry
++{
++    be<uint16_t> ID;
++    be<uint16_t> Length;
++};
++
++#pragma pack(push, 1)
++struct XACHHeader
++{
++    be<uint32_t> Signature;
++    be<uint32_t> Version;
++    be<uint32_t> Size;
++    be<uint16_t> AchievementCount;
++};
++#pragma pack(pop)
++
++enum EXACHFlags : uint32_t
++{
++    XACH_TYPE_COMPLETION = 1U,
++    XACH_TYPE_LEVELING = 2U,
++    XACH_TYPE_UNLOCK = 3U,
++    XACH_TYPE_EVENT = 4U,
++    XACH_TYPE_TOURNAMENT = 5U,
++    XACH_TYPE_CHECKPOINT = 6U,
++    XACH_TYPE_OTHER = 7U,
++    XACH_TYPE_MASK = 7U,
++    XACH_STATUS_UNACHIEVED = (1U << 4),
++    XACH_STATUS_EARNED_ONLINE = (1U << 16),
++    XACH_STATUS_EARNED = (1U << 17),
++    XACH_STATUS_EDITED = (1U << 20)
++};
++
++struct XACHEntry
++{
++    be<uint16_t> AchievementID;
++    be<uint16_t> NameID;
++    be<uint16_t> UnlockedDescID;
++    be<uint16_t> LockedDescID;
++    be<uint32_t> ImageID;
++    be<uint16_t> Gamerscore;
++    char pad0[0x02];
++    be<EXACHFlags> Flags;
++    char pad1[0x10];
++};
++
++union XDBFTitleID
++{
 +#if defined(__SWITCH__) || (defined(__GNUC__) && !defined(__clang__))
 +    struct Parts
 +    {
@@ -971,13 +3223,76 @@ index 347ac2c..2129a9b 100644
 +        char u8[0x02];
 +    } parts;
 +#else
-     struct
-     {
-         be<uint16_t> u16;
-         char u8[0x02];
-     };
--
++    struct
++    {
++        be<uint16_t> u16;
++        char u8[0x02];
++    };
 +#endif
-     be<uint32_t> u32;
- };
- 
++    be<uint32_t> u32;
++};
++
++struct XDBFTitleVersion
++{
++    be<uint16_t> Major;
++    be<uint16_t> Minor;
++    be<uint16_t> Build;
++    be<uint16_t> Revision;
++};
++
++enum EXDBFTitleType : uint32_t
++{
++    XDBF_TITLE_TYPE_SYSTEM = 0,
++    XDBF_TITLE_TYPE_FULL = 1,
++    XDBF_TITLE_TYPE_DEMO = 2,
++    XDBF_TITLE_TYPE_DOWNLOAD = 3
++};
++
++struct XTHDHeader
++{
++    be<uint32_t> Signature;
++    be<uint32_t> Version;
++    be<uint32_t> Size;
++    XDBFTitleID TitleID;
++    be<EXDBFTitleType> Type;
++    XDBFTitleVersion TitleVersion;
++    char pad0[0x10];
++};
++
++#pragma pack(push, 1)
++struct XGAAHeader
++{
++    be<uint32_t> Signature;
++    be<uint32_t> Version;
++    be<uint32_t> Size;
++    be<uint16_t> Count;
++};
++#pragma pack(pop)
++
++struct XGAAEntry
++{
++    char pad0[0x04];
++    be<uint16_t> AvatarAwardID;
++    char pad1[0x06];
++    XDBFTitleID TitleID;
++    be<uint16_t> NameID;
++    be<uint16_t> UnlockedDescID;
++    be<uint16_t> LockedDescID;
++    char pad2[0x02];
++    be<uint32_t> ImageID;
++    char pad3[0x08];
++};
++
++struct XSRCHeader
++{
++    be<uint32_t> Signature;
++    be<uint32_t> Version;
++    be<uint32_t> Size;
++    be<uint32_t> FileNameLength;
++};
++
++struct XSRCHeader2
++{
++    be<uint32_t> UncompressedSize;
++    be<uint32_t> CompressedSize;
++};

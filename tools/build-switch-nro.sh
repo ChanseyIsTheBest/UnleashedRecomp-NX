@@ -102,5 +102,5 @@ docker run "${docker_args[@]}" "${image}" sh -lc \
 echo "== Done =="
 echo "NRO: ${root_dir}${switch_build_dir#/project}/UnleashedRecomp.nro"
 echo "Debug ELF: ${root_dir}${switch_build_dir#/project}/UnleashedRecomp.debug.elf"
-echo "Switch app folder: sdmc:/switch/UnleashedRecomp/"
-echo "Installer drop folder: sdmc:/switch/UnleashedRecomp/install/"
+echo "Switch app folder: any folder of the SD card, e.g. sdmc:/switch/UnleashedRecomp/ (the game uses the NRO's folder)"
+echo "Installer drop folder: install/ next to the NRO"

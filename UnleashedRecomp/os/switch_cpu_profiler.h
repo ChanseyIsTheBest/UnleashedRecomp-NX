@@ -24,8 +24,18 @@ namespace os::switch_cpu_profiler
     // Starts the per-thread accounting, and the sampler when asked ([Switch] SwitchCpuProfiler).
     void Start(bool sampler);
 
-    // CPU time of every registered thread since the previous call, as "name 12.3%" entries. Never waits
-    // for the sampler: while it holds the thread list, the entries are left out of this report.
+    // Round 12, [Switch] SwitchSlowFrameProfileMs (set before Start; 0 = off): frames in which the game thread worked
+    // at least this long get a report of their own. The sampler then takes every sample of the game thread, running
+    // or waiting, with its callers from the stack, and keeps the last two seconds of them; Video::Present marks where
+    // each frame's work ends (FrameWorkEnd, at its start) and the next one's starts (FrameWorkStart, at its end), from
+    // the game thread. The samples inside a slow frame go to the "main in slow frames" part of the next report.
+    void SetSlowFrameThreshold(uint32_t milliseconds);
+    void FrameWorkEnd();
+    void FrameWorkStart();
+
+    // CPU time of every registered thread since the previous call, as "name 12.3%" entries (round 12: with the cores
+    // it ran on for a thread above 5%, "name 12.3% (c0 10, c2 2)"). Never waits for the sampler: while it holds the
+    // thread list, the entries are left out of this report.
     void AppendThreadCpuUsage(std::string& out);
 
     // The registered threads (kernel handle and name), for the stall watchdog. Returns how many were copied.

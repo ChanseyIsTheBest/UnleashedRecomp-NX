@@ -3,7 +3,8 @@
 // Ported from nfsmw-nx (app/src/nfsmw_pgo.cpp). GCC embeds in the executable, for every object, the
 // path UNLEASHED_RECOMP_PGO_DIR/<object path relative to the build folder, '/' replaced by '#'>.gcda,
 // with UNLEASHED_RECOMP_PGO_DIR being a folder on the build PC. The --wrap=fopen below redirects those
-// paths to sdmc:/switch/UnleashedRecomp/pgo/ with the same file names, so they can be copied back into
+// paths to the pgo folder next to the NRO (sdmc:/switch/UnleashedRecomp/pgo/ when it is there) with the same
+// file names, so they can be copied back into
 // that folder for the "use" build.
 //
 // The console does not always exit cleanly (closing from HOME kills the process), so the profile is
@@ -14,6 +15,12 @@
 #if defined(UNLEASHED_RECOMP_PGO_GENERATE) && defined(__SWITCH__)
 
 #include <switch.h>
+
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#include <os/process.h>
 
 #include <sys/stat.h>
 
@@ -37,7 +44,7 @@ extern "C"
             while (*rest == '\\' || *rest == '/')
                 rest++;
 
-            std::string redirected = "sdmc:/switch/UnleashedRecomp/pgo/";
+            std::string redirected = (os::process::GetExecutableRoot() / "pgo").string() + "/";
             for (; *rest != '\0'; rest++)
                 redirected += (*rest == '\\') ? '/' : *rest;
 
@@ -58,14 +65,15 @@ namespace
         {
             svcSleepThread(180ll * 1000 * 1000 * 1000);
 
-            mkdir("sdmc:/switch/UnleashedRecomp/pgo", 0777);
+            const std::string pgoDirectory = (os::process::GetExecutableRoot() / "pgo").string();
+            mkdir(pgoDirectory.c_str(), 0777);
 
             const u64 start = armGetSystemTick();
             __gcov_dump();
             __gcov_reset();
             const double ms = double(armTicksToNs(armGetSystemTick() - start)) / 1e6;
 
-            if (FILE* log = __real_fopen("sdmc:/switch/UnleashedRecomp/pgo/dumps.txt", "a"))
+            if (FILE* log = __real_fopen((pgoDirectory + "/dumps.txt").c_str(), "a"))
             {
                 fprintf(log, "dump %d: %.0f ms\n", dump, ms);
                 fclose(log);

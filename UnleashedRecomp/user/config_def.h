@@ -103,16 +103,16 @@ CONFIG_DEFINE_HIDDEN("Codes", bool, UseOfficialTitleOnTitleBar, false);
 
 CONFIG_DEFINE("Update", time_t, LastChecked, 0);
 
-// Switch-only options, hidden from the options menu. They stay last: Config::Save writes a section
-// header whenever the section changes from one option to the next, so a hidden option set in
-// config.toml (which is then written back) placed between two options of another section would
-// split that section in two, and TOML rejects the second [Video] header, i.e. the whole file.
+// Switch-only options, hidden from the options menu but always written to config.toml (Config::Save, since 1.0.0),
+// with their defaults the first time. They stay last: Config::Save writes a section header whenever the section
+// changes from one option to the next, so an option of this section placed between two options of another section
+// would split that section in two, and TOML rejects the second [Video] header, i.e. the whole file.
 // Performance-only switches; none of them changes what is drawn. See docs/SWITCH-PERFORMANCE.md.
 CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchConstantsUBO, true);
 CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchPipelineCache, true);
-// Requests the stock 460.8 MHz handheld GPU profile (memory stays at 1331.2 MHz). Off by
-// default because it trades battery life and heat for GPU headroom.
-CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchHandheldGpuBoost, false);
+// Requests the stock 460.8 MHz handheld GPU profile (memory stays at 1331.2 MHz), the configuration commercial games
+// ask for. On by default since 1.0.0; it trades some battery life and heat in handheld mode for GPU headroom.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchHandheldGpuBoost, true);
 // Publishes FPS and render resolution for Status Monitor / SaltyNX overlays.
 CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchOverlayFps, true);
 // The window follows the console's output: 1920x1080 docked, 1280x720 in handheld mode (a dock set to 720p counts
@@ -120,8 +120,9 @@ CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchOverlayFps, true);
 // 648p in handheld mode. Changing the option changes the value of the current mode.
 CONFIG_DEFINE_HIDDEN("Switch", float, SwitchDockedResolutionScale, 0.8f);
 CONFIG_DEFINE_HIDDEN("Switch", float, SwitchHandheldResolutionScale, 0.9f);
-// Diagnostics: write stderr.log (the renderer's and the driver's messages, the profilers' reports) and
-// UnleashedRecomp.log. Off in release builds; crash.log is written on a crash either way.
+// Diagnostics: write stderr.log (the renderer's and the driver's messages, the profilers' reports),
+// UnleashedRecomp.log and, on a crash, crash.log, next to the NRO. Off by default: no log files at all (a crash
+// still leaves Atmosphère's own report).
 CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchLog, false);
 // Requests the self-checking draw-path fast paths of nfsmw-nx's Mesa (no effect with other drivers). Off:
 // the driver now runs them only for games that ask, and round 4's GPU-bound test showed no difference.
@@ -172,6 +173,9 @@ CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchZcullGreater, true);
 // Driver: vertex shader output components the pixel shader never reads are removed when the two are
 // linked into a pipeline (NVK_LINK_VARYINGS), unless SwitchMesaEnvironment sets it itself.
 CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchLinkVaryings, true);
+// Round 14, driver: the shader compiler's Maxwell operand reuse flags (NAK_DEBUG=reuse, opt-in in the driver since NAK
+// revision 5), unless SwitchMesaEnvironment sets NAK_DEBUG itself. Changing it recompiles every shader once.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchOperandReuse, true);
 // Resolve copies (render target to texture) are made only when something needs them: a depth copy
 // waits while draws only test depth, and a clear makes only the copies of the surfaces it clears.
 CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchLazyResolves, true);
@@ -323,3 +327,147 @@ CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchGuestSpinBeforeSleep, true);
 // Environment variables for the Mesa/NVK driver, "NAME=value;NAME=value", set before the Vulkan
 // instance is created (e.g. "NVK_SWITCH_DIBUJO=0" to A/B the driver's draw-path changes).
 CONFIG_DEFINE_HIDDEN("Switch", std::string, SwitchMesaEnvironment, "");
+
+// ---- Round 11 CPU changes (test set 10). Each is exact; on by default since round 14 (played in rounds 11-13).
+// [group A1] Player/object message dispatch as a native table lookup (patches/message_dispatch.cpp);
+// the verify mode runs both paths and logs any difference.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeMessageDispatch, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchVerifyMessageDispatch, false);
+// [group A1] type_info== by an exact set of the image's type descriptors (misc_impl.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchExactTypeInfoSet, true);
+// [group A2] Native hot guest functions (patches/native_hot_patches.cpp): map find, quaternion decoder,
+// bone palette upload, render-layer mask test; the verify mode runs both and logs any difference.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeMapFind, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeQuatDecode, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeBonePalette, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeLayerMaskTest, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchVerifyNativeHotFunctions, false);
+// [group C] Present does not wait for the render thread to finish recording the frame (gpu/video.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchPresentWithoutRecordWait, true);
+// [group E] The CRI sound mixer's hot kernels as exact native code (patches/audio_dsp_patches.cpp);
+// the verify mode runs both and logs any difference. Needs the first-cutscene audio check.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeReverb, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeMixKernels, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeVoiceKernels, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchVerifyNativeAudio, false);
+// [group F1] Native LZX decoder with its state in registers (os/switch/lzx_switch.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchFastNativeDecompress, true);
+// [group F2] Pipeline cache saved only after real misses; optionally once after the post-load compiles.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchPipelineCacheSaveOnMiss, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchPipelineCacheSaveAfterCompiles, false);
+// [group F3] Guest FindFirstFile from directory entries; read-only guest files on libnx handles.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeFindFile, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeFileHandles, true);
+
+// ---- Round 12 CPU changes (frame dips). Each is exact; on by default since round 14 (played in rounds 12-13).
+// The game's "pump the database loader, Sleep(5), look again" waits for a resource poll every 0.5 ms
+// (patches/native_hot_patches.cpp, kernel/imports.cpp): only the host's sleep is shorter.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchFastResourceWaits, true);
+// Native render-walk visibility test (82E26498 with the leaf it calls), CRI playback-handle search (83167518 and its
+// three helpers) and resource-name compare (82DFAF58 with its two helper calls) (patches/native_hot_patches.cpp). The
+// verify switch of round 11 (SwitchVerifyNativeHotFunctions) covers them too.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeVisibilityTest, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeCriHandleSearch, true);
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeNameCompare, true);
+// RtlLeaveCriticalSection without the fence before it looks for waiters (kernel/imports.cpp, with
+// SwitchFastCriticalSections): the store-release that frees it and the load-acquire of the waiter count are already
+// ordered. Guest synchronisation: needs the first-cutscene audio check.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchLeanCriticalSectionLeave, true);
+// The verify modes (SwitchVerifyMessageDispatch, SwitchVerifyNativeHotFunctions, SwitchVerifyNativeAudio) compare one
+// call in this many (1 = every call, as in round 11, which was too slow to reach a stage).
+CONFIG_DEFINE_HIDDEN("Switch", int32_t, SwitchVerifyEvery, 1);
+// CPU sampler: frames whose game-thread work took at least this many milliseconds get their own report, with every
+// sample of the game thread in them (running or waiting) and its callers (0 = off).
+CONFIG_DEFINE_HIDDEN("Switch", int32_t, SwitchSlowFrameProfileMs, 0);
+// Round 13, GPU profiler: frames whose GPU time reached this many milliseconds get their own part of the pass report
+// ("[gpu slow frames]"): the passes (and, with SwitchGpuDrawProfiler, the draw groups) by the time they add in those
+// frames against the average frame, their counters, and the slowest frames whole. Turns the pass profiler on (0 = off).
+CONFIG_DEFINE_HIDDEN("Switch", int32_t, SwitchGpuSlowFrameMs, 0);
+
+// ---- Round 13 CPU changes. Each is exact; on by default since round 14 (played in round 13).
+// With SwitchNativeVisibilityTest: the render walk's visibility test prefetches the two cache lines it will wait for
+// two entries ahead (patches/native_hot_patches.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchRenderWalkPrefetch, true);
+// The light field's cell sample (decode 8 records, blend them) as native code with one flush-to-zero section instead of
+// two FPCR writes per helper call; the last blend stays the recompiled one (patches/native_hot_patches.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeLightField, true);
+// A buffer or texture lock waits only until the render thread has copied that object's earlier unlocks, instead of for
+// the whole tail of the previous Present (gpu/video.cpp, WaitForPendingUnlocks).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchPerResourceLockWait, true);
+// Vibration: a stop of the motors is sent once, not again every frame until something else was sent (an IPC each);
+// any speed other than 0 is still sent every time, and new vibration devices get a stop again (hid/driver/switch_hid.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchVibrationDedupe, true);
+
+// ---- Round 14 CPU changes. Each is exact; on by default since round 15 (played in round 14, first-cutscene audio check
+// passed).
+// An event set or semaphore release wakes the KeWaitForMultipleObjects callers only when one of them waits on that
+// object, instead of every such caller for every signal (kernel/imports.cpp). Guest synchronisation: needs the
+// first-cutscene audio check.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchTargetedDispatcherWakeups, true);
+// A semaphore release of one unit wakes one of its waiters, not all of them (kernel/imports.cpp): the game's worker
+// threads wait on shared semaphores and each job woke every one of them. Guest synchronisation: needs the
+// first-cutscene audio check.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchSemaphoreWakeOne, true);
+// RtlEnterCriticalSection with a strong compare-and-swap: a weak one could fail on a free critical section (another write
+// to its cache line) and the thread then waited up to 1 ms for an owner that did not exist (kernel/imports.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchStrongCriticalSectionCas, true);
+// RtlEnterCriticalSection watches an owned critical section for ~2 µs before it waits in the kernel (kernel/imports.cpp).
+// Both are guest synchronisation: they need the first-cutscene audio check.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchCriticalSectionSpin, true);
+
+// ---- Round 15 CPU changes. Each is exact; on by default since round 15 was played (2026-10-02: faster in the stages, round 15 on vs off).
+// The SwitchVerifyNativeHotFunctions / SwitchVerifyNativeAudio modes and SwitchVerifyEvery cover the natives.
+// CRI ADX decoder (8316AFE0) with a shorter per-sample dependency chain and stereo channels interleaved
+// (patches/audio_dsp_patches.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeAdxDecoder, true);
+// CRI resampler inner loop (8315AC20) in single precision with its counters in registers (tools/switch-localize.py,
+// part of the resampler's copy: needs SwitchNativeVoiceKernels).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchFastAudioResampler, true);
+// The CRI mixer's reverb block loop (83146300) localized with its per-sample step inlined
+// (patches/audio_dsp_patches.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchLocalizedCriHelpers, true);
+// The engine's small-object pool allocator (82E02BD8 pop, 82E02CF8 push) without its virtual lock calls
+// (patches/native_r15_pool.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativePoolAllocator, true);
+// Path following (822D22C8 and its twelve helpers) as one copy of the recompiled code with the registers and the
+// flush mode in locals (patches/native_r15_localized.cpp; needs a SWITCH_EXPLICIT_FMA build).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativePathFollowing, true);
+// Material (UV) animation keyframe search and lerp (82E46FA0) (patches/native_r15_material.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeMaterialAnimation, true);
+// Havok spline-compressed animation sampling (82FC4390 and its six helpers) as one copy of the recompiled code with
+// the registers and the flush mode in locals (patches/native_r15_localized.cpp; needs a SWITCH_EXPLICIT_FMA build).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeSplineAnimation, true);
+// Havok MOPP virtual machines (long ray 82F78FB0, query 82F78148) as copies of the recompiled code with the registers
+// and the flush mode in locals (patches/native_r15_localized.cpp; needs a SWITCH_EXPLICIT_FMA build).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchNativeMoppVm, true);
+// The scene-graph update walk (its node and object loops) prefetches the next child node while the current one is
+// processed (mid-asm hooks in patches/native_r15.cpp; a prefetch changes no value).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchSceneGraphPrefetch, true);
+// The UI modifier cache with 4,096 two-way entries instead of 512 direct-mapped ones (patches/aspect_ratio_patches.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchLargeModifierCache, true);
+
+// ---- Round 15 GPU changes. Each is exact; on by default since round 15 was played (2026-10-02: 39.7 vs 37.7 FPS, same route).
+// Resolve copies that nothing reads before they are fully rewritten draw nothing: each copy's vertex shader reads a word
+// the render thread writes just before the frame is submitted, from what the rest of the frame did with the texture
+// (no look-ahead into the render queue, no wait; gpu/video.cpp, shader/copy_conditional_vs.hlsl).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchSubmitTimeCopies, true);
+// A pending depth resolve waits (SwitchLazyResolves) for draws that only test the depth buffer while its texture is bound
+// in slots their shaders cannot sample (the translator's sampler masks): the buffer is attached read-only, where those
+// slots can still sample it later (gpu/video.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchSampledSlotResolves, true);
+// From MarathonRecomp-NX: a draw that only tests its depth buffer while sampling one of its pending resolves attaches it
+// read-only and samples it, instead of copying it first (gpu/video.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchReadOnlyDepthSampling, true);
+// From MarathonRecomp-NX: with the uniform-buffer constants (SwitchConstantsUBO), a resolve copy no longer forces the next
+// draw to upload its vertex constants again; their pointer is pushed again when needed (gpu/video.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchCopyKeepsVertexConstants, true);
+// From MarathonRecomp-NX: the frame's two timestamp queries reset one at a time on the 3D engine instead of a copy-engine
+// fill at the start of every frame (gpu/video.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchQueryResetPerQuery, true);
+// The late pass's depth restore (a copy of the main depth into a second buffer the late draws only test against) is not
+// drawn: the second buffer stands for the main one, attached read-only, until the two would differ, when it gets the
+// copy (decided at submit when the main depth changes; gpu/video.cpp).
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchDepthRestoreAlias, true);
+// The UI's modifier lookups that miss the cache find the path in a hash index instead of walking the ordered map of
+// every loaded path (patches/aspect_ratio_patches.cpp, with SwitchModifierCache). Same answers.
+CONFIG_DEFINE_HIDDEN("Switch", bool, SwitchModifierIndex, true);

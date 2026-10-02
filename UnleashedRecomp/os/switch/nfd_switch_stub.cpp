@@ -9,9 +9,21 @@
 
 #include <nfd.h>
 
+// os/process.h (os/switch/process_switch.cpp, linked into the same executable); this library does not have the
+// game's include path.
+namespace os::process
+{
+    std::filesystem::path GetExecutableRoot();
+}
+
 namespace
 {
-    constexpr const char* kSwitchInstallDropPath = "sdmc:/switch/UnleashedRecomp/install";
+    // The "install" folder next to the NRO, wherever it is on the SD card (os/switch/process_switch.cpp).
+    std::string InstallDropPath()
+    {
+        return (os::process::GetExecutableRoot() / "install").string();
+    }
+
     constexpr const char* kGameExecutableFile = "default.xex";
     constexpr const char* kUpdateExecutablePatchFile = "default.xexp";
     constexpr const char* kDLCValidationFile = "DLC.xml";
@@ -144,10 +156,11 @@ namespace
         }
 
         std::error_code ec;
-        const std::filesystem::path installDropPath(kSwitchInstallDropPath);
+        const std::string installDropText = InstallDropPath();
+        const std::filesystem::path installDropPath(installDropText);
         if (!std::filesystem::exists(installDropPath, ec) || !std::filesystem::is_directory(installDropPath, ec))
         {
-            SetError(std::string("Create ") + kSwitchInstallDropPath + " and put your Xbox 360 ISO, GOD/STFS containers, update, or DLC files there.");
+            SetError(std::string("Create ") + installDropText + " and put your Xbox 360 ISO, GOD/STFS containers, update, or DLC files there.");
             return NFD_ERROR;
         }
 
@@ -173,7 +186,7 @@ namespace
 
         if (pathSet->paths.empty())
         {
-            SetError(std::string("No selectable content was found in ") + kSwitchInstallDropPath + ". For extracted folders, put default.xex or default.xexp at the folder root or one nested folder below it.");
+            SetError(std::string("No selectable content was found in ") + installDropText + ". For extracted folders, put default.xex or default.xexp at the folder root or one nested folder below it.");
             return NFD_ERROR;
         }
 

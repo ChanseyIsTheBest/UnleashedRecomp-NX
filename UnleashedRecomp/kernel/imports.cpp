@@ -35,8 +35,21 @@ static std::condition_variable g_dispatcherCv;
 // under the mutex (after the change, which it then sees) before it waits.
 bool g_fastEvents = false;
 static uint32_t g_dispatcherWaiters; // Under g_dispatcherMutex.
+// [Switch] Round 14, SwitchTargetedDispatcherWakeups (set in main() before any guest code runs). Every event set and
+// semaphore release advanced the dispatcher generation and woke every KeWaitForMultipleObjects caller, whatever it
+// waited on; the CRI sound server sat in that loop for most of its CPU time, waking up only to find its own objects
+// unchanged. Each event and semaphore now counts the KeWaitForMultipleObjects calls that wait on it (registered under
+// its mutex before they look at it), and only a signal of an object with such waiters advances the generation. A
+// waiter registered before the signal's critical section is notified; one registered after it sees the new state when
+// it looks. Reset and waits never made a waiter's condition true, so nothing else needs the generation.
+bool g_targetedDispatcherWakeups = false;
+// [Switch] Round 14, SwitchSemaphoreWakeOne (set in main() before any guest code runs): a release of one unit wakes one
+// of the semaphore's waiters instead of all of them (Semaphore::Release).
+bool g_semaphoreWakeOne = false;
 #else
 static constexpr bool g_fastEvents = false;
+static constexpr bool g_targetedDispatcherWakeups = false;
+static constexpr bool g_semaphoreWakeOne = false;
 static uint32_t g_dispatcherWaiters;
 #endif
 
@@ -84,6 +97,7 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     std::condition_variable cv;
     bool signaled;
     uint32_t waiters = 0; // Under mutex (SwitchFastEvents).
+    uint32_t dispatcherWaiters = 0; // Under mutex (SwitchTargetedDispatcherWakeups).
 
     Event(XKEVENT* header)
         : manualReset(!header->Type), signaled(!!header->SignalState)
@@ -141,11 +155,13 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     {
         bool previousState;
         bool notify;
+        bool notifyDispatcher;
         {
             std::lock_guard lock(mutex);
             previousState = signaled;
             signaled = true;
             notify = !g_fastEvents || waiters != 0;
+            notifyDispatcher = !g_targetedDispatcherWakeups || dispatcherWaiters != 0;
         }
 
         if (notify)
@@ -156,7 +172,8 @@ struct Event final : KernelObject, HostObject<XKEVENT>
                 cv.notify_one();
         }
 
-        NotifyDispatcherWaiters();
+        if (notifyDispatcher)
+            NotifyDispatcherWaiters();
 
         return previousState;
     }
@@ -177,6 +194,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
     uint32_t count;
     uint32_t maximumCount;
     uint32_t waiters = 0; // Under mutex (SwitchFastEvents).
+    uint32_t dispatcherWaiters = 0; // Under mutex (SwitchTargetedDispatcherWakeups).
 
     Semaphore(XKSEMAPHORE* semaphore)
         : count(semaphore->Header.SignalState), maximumCount(semaphore->Limit)
@@ -232,6 +250,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
     void Release(uint32_t releaseCount, uint32_t* previousCount)
     {
         bool notify;
+        bool notifyDispatcher;
         {
             std::lock_guard lock(mutex);
             assert(releaseCount <= maximumCount - count);
@@ -241,11 +260,21 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
 
             count += releaseCount;
             notify = !g_fastEvents || waiters != 0;
+            notifyDispatcher = !g_targetedDispatcherWakeups || dispatcherWaiters != 0;
         }
 
+        // SwitchSemaphoreWakeOne: one unit lets one waiter through, so one is woken (the others would find the count 0
+        // again and go back to sleep). A woken waiter takes the unit under the mutex; one that timed out meanwhile still
+        // takes it if it is there when it looks (wait_for checks the count), so no unit is left with a waiter asleep.
         if (notify)
-            cv.notify_all();
-        NotifyDispatcherWaiters();
+        {
+            if (g_semaphoreWakeOne && releaseCount == 1)
+                cv.notify_one();
+            else
+                cv.notify_all();
+        }
+        if (notifyDispatcher)
+            NotifyDispatcherWaiters();
     }
 };
 
@@ -662,6 +691,14 @@ uint32_t RtlUnicodeToMultiByteN(char* MultiByteString, uint32_t MaxBytesInMultiB
     return STATUS_SUCCESS;
 }
 
+#if defined(__SWITCH__)
+// [Switch] SwitchFastResourceWaits (patches/native_hot_patches.cpp): set on a thread while it runs one of the game's
+// loops that pump the database loader, Sleep(5) and look again whether a resource is ready. That Sleep(5) then lasts
+// 0.5 ms: the loop sees the resource ready (and pumps the loader's next step) up to 4.5 ms sooner. Everything the
+// guest sees is the same; only the host sleeps less.
+thread_local bool t_fastResourceWait = false;
+#endif
+
 uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
 {
     // We don't do async file reads.
@@ -675,7 +712,10 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* 
 #elif defined(__SWITCH__)
     // Sleep(0) semantics need a real sleep on Horizon: yield() never runs
     // lower-priority threads queued on this core.
-    svcSleepThread(timeout == 0 ? 10000 : timeout * 1000000ll);
+    if (t_fastResourceWait && timeout == 5)
+        svcSleepThread(500000);
+    else
+        svcSleepThread(timeout == 0 ? 10000 : timeout * 1000000ll);
 #else
     if (timeout == 0)
         std::this_thread::yield();
@@ -817,6 +857,29 @@ uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity, be<uint32_t>* l
 // leaver that sees no waiter cleared the owner before the waiter compared it, and the waiter does not sleep.
 // A critical section whose LockCount did not start at -1 just keeps getting the call.
 bool g_fastCriticalSections = false;
+
+// [Switch] SwitchLeanCriticalSectionLeave (round 12, off unless the configuration turns it on; with
+// SwitchFastCriticalSections): the final leave clears the owner with a sequentially consistent store and then reads
+// the waiter count with a sequentially consistent load. Those two are already ordered (the single total order of
+// seq_cst operations; on AArch64 an STLR and a later LDAR are never reordered), so the full fence between them, a
+// DMB on every final leave, adds nothing. The waiter's side keeps its fence: the kernel's compare is not a C++ load.
+bool g_leanCriticalSectionLeave = false;
+
+// [Switch] Round 14, SwitchStrongCriticalSectionCas (off unless the configuration turns it on). The enter's
+// compare-and-swap was a weak one: on AArch64 a single load-exclusive/store-exclusive attempt, which fails whenever the
+// cache line was written in between, even by another field of the same critical section (the waiter count) or another
+// variable in that line. It then reports the owner it read, 0, and the thread waited for the owner word to stop being 0:
+// on a free critical section, until some later leave signalled it or the 1 ms safety timeout of the wait expired. The
+// strong compare-and-swap retries such a failure itself, so a failure always means another owner.
+bool g_strongCriticalSectionCas = false;
+
+// [Switch] Round 14, SwitchCriticalSectionSpin (off unless the configuration turns it on): before it waits in the
+// kernel, a thread that found the critical section owned watches the owner word (reading only, ~2 µs at most, the guest
+// spin lock's SpinUntilFree) and tries again as soon as it clears: most critical sections are held for far less than a
+// wait and its wake-up take. A longer hold costs the spin once, then the thread sleeps as before.
+bool g_criticalSectionSpin = false;
+
+static bool SpinUntilFree(std::atomic_ref<uint32_t>& lock);
 #endif
 
 void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
@@ -831,8 +894,9 @@ void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
 #if defined(__SWITCH__)
     if (g_fastCriticalSections)
     {
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (std::atomic_ref(cs->LockCount).load() == -1)
+        if (!g_leanCriticalSectionLeave)
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (std::atomic_ref(cs->LockCount).load(std::memory_order_seq_cst) == -1)
             return;
     }
 
@@ -868,13 +932,22 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
     {
         uint32_t previousOwner = 0;
 
+#if defined(__SWITCH__)
+        const bool acquired = g_strongCriticalSectionCas ? owningThread.compare_exchange_strong(previousOwner, thisThread) :
+            owningThread.compare_exchange_weak(previousOwner, thisThread);
+        if (acquired || previousOwner == thisThread)
+#else
         if (owningThread.compare_exchange_weak(previousOwner, thisThread) || previousOwner == thisThread)
+#endif
         {
             cs->RecursionCount++;
             return;
         }
 
 #if defined(__SWITCH__)
+        if (g_criticalSectionSpin && SpinUntilFree(owningThread))
+            continue;
+
         if (g_fastCriticalSections)
         {
             std::atomic_ref waiters(cs->LockCount);
@@ -1722,6 +1795,56 @@ void NetDll_XNetGetTitleXnAddr()
     LOG_UTILITY("!!! STUB !!!");
 }
 
+// [Switch] SwitchTargetedDispatcherWakeups: a KeWaitForMultipleObjects call that may wait counts itself on each of its
+// objects, under the object's mutex, before it first looks at them, and uncounts itself on every return.
+struct DispatcherWaiterSlot
+{
+    std::mutex* mutex;
+    uint32_t* count;
+};
+
+struct DispatcherWaiterRegistration
+{
+    std::vector<DispatcherWaiterSlot>& slots;
+
+    DispatcherWaiterRegistration(std::vector<DispatcherWaiterSlot>& slots, uint32_t count, xpointer<XDISPATCHER_HEADER>* objects, KernelObject* const* kernelObjects)
+        : slots(slots)
+    {
+        slots.clear();
+        if (!g_targetedDispatcherWakeups)
+            return;
+
+        for (uint32_t i = 0; i < count; i++)
+        {
+            if (objects[i].get()->Type == 5)
+            {
+                auto* semaphore = static_cast<Semaphore*>(kernelObjects[i]);
+                slots.push_back({ &semaphore->mutex, &semaphore->dispatcherWaiters });
+            }
+            else
+            {
+                auto* event = static_cast<Event*>(kernelObjects[i]);
+                slots.push_back({ &event->mutex, &event->dispatcherWaiters });
+            }
+        }
+
+        for (auto& slot : slots)
+        {
+            std::lock_guard lock(*slot.mutex);
+            ++*slot.count;
+        }
+    }
+
+    ~DispatcherWaiterRegistration()
+    {
+        for (auto& slot : slots)
+        {
+            std::lock_guard lock(*slot.mutex);
+            --*slot.count;
+        }
+    }
+};
+
 uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* Objects, uint32_t WaitType, uint32_t WaitReason, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
     const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
@@ -1778,6 +1901,9 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
             s_objects[i] = queryObject(*object);
         }
 
+        thread_local std::vector<DispatcherWaiterSlot> s_slots;
+        DispatcherWaiterRegistration registration(s_slots, timeout != 0 ? Count : 0, Objects, s_objects.data());
+
         while (true)
         {
             const uint32_t generation = g_dispatcherGeneration.load(std::memory_order_acquire);
@@ -1820,6 +1946,9 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
 
             s_objects[i] = queryObject(*object);
         }
+
+        thread_local std::vector<DispatcherWaiterSlot> s_slots;
+        DispatcherWaiterRegistration registration(s_slots, timeout != 0 ? Count : 0, Objects, s_objects.data());
 
         while (true)
         {

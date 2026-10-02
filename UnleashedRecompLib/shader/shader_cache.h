@@ -14,6 +14,9 @@ struct ShaderCacheEntry
     const uint32_t gatherSlots;
     // SHADER_FLAG_* (shader_common.h).
     const uint32_t flags;
+    // [Switch] Round 15: the texture slots the shader can fetch from (bit s = slot s; its declared samplers, a
+    // superset of the slots it reads). Every bit set when the translator did not fill it in.
+    const uint32_t textureSlotsRead = 0xFFFFFFFF;
     struct GuestShader* guestShader;
 };
 

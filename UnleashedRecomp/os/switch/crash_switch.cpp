@@ -1,4 +1,9 @@
+#include <filesystem>
+#include <string>
+#include <vector>
+
 #include <os/switch_crash.h>
+#include <os/process.h>
 #include <os/switch_cpu_profiler.h>
 #include <os/switch_stall_watch.h>
 
@@ -11,6 +16,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 // See os/switch_crash.h. Nothing here takes a lock or allocates once a report has started: the thread that
 // crashed may hold the heap's, stdio's or the profiler's. The report is formatted into a static buffer and
@@ -18,7 +24,10 @@
 
 namespace
 {
-    constexpr const char* CRASH_PATH = "/switch/UnleashedRecomp/crash.log"; // On sdmc.
+    // On sdmc, next to the NRO (Init fills them in from os::process::GetExecutableRoot()).
+    char g_crashDirectory[256] = "/switch/UnleashedRecomp";
+    char g_crashPath[288] = "/switch/UnleashedRecomp/crash.log";
+    bool g_writeCrashLog = false; // SwitchLog: no log file at all without it.
     constexpr size_t STACK_DUMP_BYTES = 0x200;
     constexpr uint32_t BACKTRACE_DEPTH = 24;
     constexpr uint32_t STACK_SCAN_WORDS = 2048; // 16 KB of stack searched for return addresses.
@@ -115,17 +124,20 @@ namespace
             (unsigned long long)ModuleBase());
     }
 
-    // Appends the report to crash.log (and to stderr.log with SwitchLog when `stderrToo`).
+    // Appends the report to crash.log (and to stderr.log when `stderrToo`), with SwitchLog only.
     void WriteReport(bool stderrToo)
     {
+        if (!g_writeCrashLog)
+            return;
+
         if (FsFileSystem* fs = fsdevGetDeviceFileSystem("sdmc"))
         {
             fsFsCreateDirectory(fs, "/switch");
-            fsFsCreateDirectory(fs, "/switch/UnleashedRecomp");
-            fsFsCreateFile(fs, CRASH_PATH, 0, 0); // Fails when it exists, which is fine.
+            fsFsCreateDirectory(fs, g_crashDirectory); // Both fail when they exist, which is fine.
+            fsFsCreateFile(fs, g_crashPath, 0, 0);
 
             FsFile file;
-            if (R_SUCCEEDED(fsFsOpenFile(fs, CRASH_PATH, FsOpenMode_Write | FsOpenMode_Append, &file)))
+            if (R_SUCCEEDED(fsFsOpenFile(fs, g_crashPath, FsOpenMode_Write | FsOpenMode_Append, &file)))
             {
                 s64 size = 0;
                 fsFileGetSize(&file, &size);
@@ -291,6 +303,18 @@ extern "C"
 void os::switch_crash::Init(bool alsoStderr)
 {
     g_alsoStderr = alsoStderr;
+    g_writeCrashLog = alsoStderr;
+
+    // The NRO's folder without the device: "sdmc:/switch/SonicUnleashed" -> "/switch/SonicUnleashed". Formatted now,
+    // since nothing may allocate once a report has started.
+    const std::string root = os::process::GetExecutableRoot().string();
+    if (root.rfind("sdmc:/", 0) == 0)
+    {
+        const std::string directory = root.substr(5);
+        snprintf(g_crashDirectory, sizeof(g_crashDirectory), "%s", directory.c_str());
+        snprintf(g_crashPath, sizeof(g_crashPath), "%s/crash.log", directory == "/" ? "" : directory.c_str());
+    }
+
     plume::SetSwitchDriverMessageCallback(OnDriverMessage);
     plume::SetSwitchDeviceLostCallback(OnDeviceLost);
 }

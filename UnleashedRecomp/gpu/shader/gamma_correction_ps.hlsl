@@ -29,6 +29,11 @@ float4 main(in float4 position : SV_Position) : SV_Target
     if (boxed) movedPosition = 0;
     
     float4 color = boxed ? 0.0 : texture.Load(int3(movedPosition, 0));
-    color.rgb = pow(color.rgb, g_Gamma);
+    // [Switch] Round 13: with the default brightness and no Xbox colour correction every exponent is exactly 1, and
+    // pow (exp2 of log2, two special-function operations per channel) only returns its input to within a few units in
+    // the last place. The input is an 8-bit channel (k / 255) and the target is 8-bit, so that error never moves the
+    // stored value: skipping it leaves every pixel the same. The branch is uniform (push constants).
+    if (any(g_Gamma != 1.0))
+        color.rgb = pow(color.rgb, g_Gamma);
     return color;
 }

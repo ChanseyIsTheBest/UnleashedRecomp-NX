@@ -158,6 +158,9 @@ static void SetHostThreadCore(int32_t core)
 
 #include "shader/blend_color_alpha_ps.hlsl.spirv.h"
 #include "shader/copy_vs.hlsl.spirv.h"
+#if defined(__SWITCH__)
+#include "shader/copy_conditional_vs.hlsl.spirv.h"
+#endif
 #include "shader/copy_color_ps.hlsl.spirv.h"
 #include "shader/copy_depth_ps.hlsl.spirv.h"
 #include "shader/csd_filter_ps.hlsl.spirv.h"
@@ -248,6 +251,10 @@ namespace plume
             setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
 
             ConfigureVulkanPipelineCache(cachePath.string(), buildTag);
+
+            // [Switch] SwitchPipelineCacheSaveOnMiss: a save writes nothing when every creation since the last one
+            // hit the cache (plume-switch-perf.patch).
+            plume::SetSwitchPipelineCacheSaveOnMiss(Config::SwitchPipelineCacheSaveOnMiss);
         }
 
         SetVulkanPreciseBarriers(Config::SwitchPreciseBarriers);
@@ -257,6 +264,11 @@ namespace plume
         if (Config::SwitchZcullGreater)
             setenv("NVK_ZCULL", "greater", 1);
         setenv("NVK_LINK_VARYINGS", Config::SwitchLinkVaryings ? "1" : "0", 1);
+        // Round 14, SwitchOperandReuse: the shader compiler's Maxwell operand reuse flags, opt-in in the driver since NAK
+        // revision 5 and asked for by this game only (measured 22.63 -> 22.49 ms at the hub; ruled out as the cause of the
+        // dark eyes in round 13). The flag is part of the shader cache key: switching it recompiles every shader once.
+        if (Config::SwitchOperandReuse)
+            setenv("NAK_DEBUG", "reuse", 1);
 
         // [Switch] SwitchMesaEnvironment = "NAME=value;NAME=value": driver switches such as the
         // nfsmw-nx ones (NVK_SWITCH_DIBUJO, NVK_SWITCH_DYN_UBO_DELTA, NVK_COPY_ENGINE,
@@ -663,12 +675,41 @@ struct DrawProfilerDraw
     uint32_t count; // Vertices or indices, times instances.
 };
 
+// Round 13: what the render thread did in one frame, from its report counters (PassProfilerReadCounters), for
+// the slow-frame part of the report.
+struct PassProfilerCounters
+{
+    uint64_t resolveCopies = 0;
+    uint64_t resolvePixels = 0;
+    uint64_t textureUpdates = 0;
+    uint64_t bufferUnlocks = 0;
+    uint64_t barrierBatches = 0;
+    uint64_t midPassBarrierBatches = 0;
+    uint64_t constantBytes = 0;
+    uint64_t pipelines = 0;
+    double pipelineMs = 0.0;
+
+    void Add(const PassProfilerCounters& other)
+    {
+        resolveCopies += other.resolveCopies;
+        resolvePixels += other.resolvePixels;
+        textureUpdates += other.textureUpdates;
+        bufferUnlocks += other.bufferUnlocks;
+        barrierBatches += other.barrierBatches;
+        midPassBarrierBatches += other.midPassBarrierBatches;
+        constantBytes += other.constantBytes;
+        pipelines += other.pipelines;
+        pipelineMs += other.pipelineMs;
+    }
+};
+
 struct PassProfilerFrame
 {
     std::unique_ptr<RenderQueryPool> queries;
     std::vector<PassProfilerPass> passes;
     std::unique_ptr<RenderQueryPool> drawQueries[DRAW_PROFILER_MAX_POOLS];
     std::vector<DrawProfilerDraw> draws;
+    PassProfilerCounters counters; // Round 13: this frame's share of the report counters.
     bool recorded = false;
 };
 
@@ -774,10 +815,92 @@ static uint64_t g_profilerDeadCopiesSkipped;  // Round 9: SwitchSkipDeadCopies (
 static uint64_t g_profilerDeadCopiesRead;
 static uint64_t g_profilerDeadCopiesUnknown;
 static uint64_t g_profilerDeadCopyWaitUs;
+static uint64_t g_profilerSubmitCopiesDropped; // Round 15: SwitchSubmitTimeCopies, copies decided at submit to draw nothing
+static uint64_t g_profilerSubmitCopiesKept;    // Round 15: and the ones decided to draw
+static uint64_t g_profilerReadOnlyDepthDraws;  // Round 15: SwitchReadOnlyDepthSampling, draws with their depth read-only
+static uint64_t g_profilerDepthAliasRestores;  // Round 15: SwitchDepthRestoreAlias, restore draws not made
+static uint64_t g_profilerSampledSlotDraws;    // Round 15: SwitchSampledSlotResolves, draws leaving the copy pending
+static uint64_t g_profilerDepthAliasDraws;     // Round 15: draws tested against the source instead
+static uint64_t g_profilerDepthAliasCopies;    // Round 15: copies made when the two would have differed
 static uint64_t g_profilerNoOpDraws;
 static uint64_t g_profilerPipelineCacheHits;
+// Round 12: pipelines the render thread had to create when a draw needed them (FindOrCreateGraphicsPipeline), and the
+// time it spent on them: a draw cannot be recorded before its pipeline exists, so this time stalls the frame.
+static uint32_t g_profilerRenderThreadPipelines;
+static double g_profilerRenderThreadPipelineMs;
+static double g_profilerRenderThreadPipelineLongestMs;
 static uint64_t g_profilerSamplerCacheHits;
 static std::atomic<uint64_t> g_profilerStatesSkipped;
+
+// Round 13: [Switch] SwitchGpuSlowFrameMs, the GPU counterpart of the CPU profiler's slow frames: every frame
+// whose GPU time (frame start to end timestamp) reaches the threshold also goes into totals of its own, per
+// pass and (with the draw profiler) per draw group, so the report can say which passes grow in those frames
+// and by how much, next to the same passes over all frames. The three slowest frames of each report are
+// listed whole. 0 turns it off.
+static double g_gpuSlowFrameMs;
+static PassProfilerCounters g_passProfilerFrameStart; // The counters when the frame being recorded began.
+static PassProfilerCounters g_gpuAllCounters;
+static PassProfilerCounters g_gpuSlowCounters;
+static uint64_t g_gpuAllDraws;
+static uint64_t g_gpuSlowDraws;
+static uint32_t g_gpuSlowFrames;
+static double g_gpuSlowFrameMsSum;
+static double g_gpuSlowFrameLongestMs;
+static uint32_t g_passProfilerFrameNumber;      // Frames collected since the start, for the slowest-frame lines.
+static std::vector<PassProfilerTotal> g_gpuSlowPassTotals;
+static ankerl::unordered_dense::map<DrawProfilerKey, DrawProfilerTotal, DrawProfilerKeyHash> g_drawProfilerSlowTotals;
+
+static const std::chrono::steady_clock::time_point g_passProfilerStartTime = std::chrono::steady_clock::now();
+
+struct GpuSlowFrame
+{
+    double ms = 0.0;
+    double seconds = 0.0; // Since the start of the game, when the frame's timestamps were read.
+    uint32_t frameNumber = 0;
+    uint64_t draws = 0;
+    PassProfilerCounters counters;
+    std::string passes; // Its most expensive passes, formatted when the frame is taken.
+};
+
+static std::vector<GpuSlowFrame> g_gpuSlowestFrames; // At most GPU_SLOW_FRAMES_LISTED, slowest first.
+static constexpr size_t GPU_SLOW_FRAMES_LISTED = 3;
+
+// Report counters keep counting over the report, so a frame's share is the difference between its end and its
+// start; a report that resets them in between (only possible when Present runs on the game's thread) leaves the
+// end value as the frame's share.
+static PassProfilerCounters PassProfilerReadCounters()
+{
+    PassProfilerCounters counters;
+    for (uint64_t count : g_profilerResolveCopies)
+        counters.resolveCopies += count;
+    counters.resolvePixels = g_profilerResolvePixels;
+    counters.textureUpdates = g_profilerTextureUpdates;
+    counters.bufferUnlocks = g_profilerStreamedBuffers + g_profilerCopiedBuffers;
+    counters.barrierBatches = g_profilerBarrierBatches;
+    counters.midPassBarrierBatches = g_profilerMidPassBarrierBatches;
+    counters.constantBytes = g_profilerConstantBytes;
+    counters.pipelines = g_profilerRenderThreadPipelines;
+    counters.pipelineMs = g_profilerRenderThreadPipelineMs;
+    return counters;
+}
+
+static PassProfilerCounters PassProfilerCountersSince(const PassProfilerCounters& start)
+{
+    const PassProfilerCounters end = PassProfilerReadCounters();
+    auto since = [](auto value, auto begin) { return value >= begin ? value - begin : value; };
+
+    PassProfilerCounters counters;
+    counters.resolveCopies = since(end.resolveCopies, start.resolveCopies);
+    counters.resolvePixels = since(end.resolvePixels, start.resolvePixels);
+    counters.textureUpdates = since(end.textureUpdates, start.textureUpdates);
+    counters.bufferUnlocks = since(end.bufferUnlocks, start.bufferUnlocks);
+    counters.barrierBatches = since(end.barrierBatches, start.barrierBatches);
+    counters.midPassBarrierBatches = since(end.midPassBarrierBatches, start.midPassBarrierBatches);
+    counters.constantBytes = since(end.constantBytes, start.constantBytes);
+    counters.pipelines = since(end.pipelines, start.pipelines);
+    counters.pipelineMs = since(end.pipelineMs, start.pipelineMs);
+    return counters;
+}
 
 // Round 8: the statistics the game's thread counts (it is their only writer) without an atomic read-modify-write
 // (a load/store-exclusive loop on the Cortex-A57) per render state and draw; the report on the render thread
@@ -810,6 +933,11 @@ static uint32_t g_profilerFrameTimeFrames;
 // SwitchPresentOnRenderThread: the render thread adds its present, GPU and acquire times, and reports.
 static std::mutex g_frameTimesMutex;
 static bool g_presentOnRenderThread = false; // See PresentOnRenderThread.
+// SwitchPresentWithoutRecordWait (with SwitchPresentOnRenderThread): see Video::Present.
+static bool g_presentWithoutRecordWait = false;
+static std::atomic<uint64_t> g_presentTailLockWaitNanoseconds{ 0 };
+// Round 13, SwitchPerResourceLockWait: see WaitForPendingUnlocks.
+static bool g_perResourceLockWait = false;
 // What the resolve copies about to be recorded are due to (set by the callers).
 static uint32_t g_resolveCopyTrigger = PASS_PROFILER_COPIES_BEFORE_DRAW;
 // Render commands the render thread has taken off its queue (only it writes this), for the stall
@@ -904,6 +1032,7 @@ static void PassProfilerBeginFrame()
         return;
 
     g_commandLists[g_frame]->resetQueryPool(frame.queries.get(), 0, PASS_PROFILER_MAX_PASSES + 1);
+    g_passProfilerFrameStart = PassProfilerReadCounters();
 
     // Queries may only be reset outside render passes, so every pool is reset here.
     if (g_drawProfilerEnabled)
@@ -1218,6 +1347,7 @@ static void PassProfilerEndFrame()
             g_commandLists[g_frame]->writeTimestamp(pool, i);
     }
 
+    frame.counters = PassProfilerCountersSince(g_passProfilerFrameStart);
     frame.recorded = true;
 }
 
@@ -1318,6 +1448,220 @@ static void DrawProfilerPrint(double frames, std::string& report)
     }
 }
 
+// The entry of `totals` for a pass description and its order among passes with that description.
+static PassProfilerTotal* FindPassTotal(std::vector<PassProfilerTotal>& totals, const PassProfilerPass& pass, uint32_t ordinal,
+    bool add)
+{
+    for (auto& candidate : totals)
+    {
+        const auto& p = candidate.pass;
+        if (candidate.ordinal == ordinal && p.width == pass.width && p.height == pass.height &&
+            p.colorFormat == pass.colorFormat && p.depthFormat == pass.depthFormat && p.samples == pass.samples &&
+            p.kind == pass.kind)
+        {
+            return &candidate;
+        }
+    }
+
+    if (!add)
+        return nullptr;
+
+    totals.push_back(PassProfilerTotal{ pass, ordinal, 0.0, 0 });
+    return &totals.back();
+}
+
+// A pass as the pass table names it, without its time and draws.
+static std::string PassProfilerDescribe(const PassProfilerPass& p, uint32_t ordinal)
+{
+    if (p.kind != PASS_PROFILER_PASS)
+    {
+        static constexpr const char* TRIGGERS[] = { "", "before-draw", "at-clear", "at-present", "other" };
+        return fmt::format("{}x{} {} x{} copies {} #{}", p.width, p.height,
+            PassProfilerFormatName(p.colorFormat != RenderFormat::UNKNOWN ? p.colorFormat : p.depthFormat), p.samples,
+            TRIGGERS[p.kind < PASS_PROFILER_KINDS ? p.kind : 0], ordinal);
+    }
+
+    if (p.width == 0)
+        return "frame start (no target)";
+
+    return fmt::format("{}x{} {} x{} depth {} #{}", p.width, p.height, PassProfilerFormatName(p.colorFormat), p.samples,
+        PassProfilerFormatName(p.depthFormat), ordinal);
+}
+
+// SwitchGpuSlowFrameMs: a frame at or over the threshold goes into the slow-frame totals, and into the list of the
+// report's slowest frames if it is one of them.
+static void PassProfilerTakeSlowFrame(const PassProfilerFrame& frame, const std::vector<uint32_t>& ordinals,
+    const std::vector<double>& passMs, uint64_t draws, double gpuFrameMs)
+{
+    g_gpuSlowFrames++;
+    g_gpuSlowFrameMsSum += gpuFrameMs;
+    g_gpuSlowFrameLongestMs = std::max(g_gpuSlowFrameLongestMs, gpuFrameMs);
+    g_gpuSlowCounters.Add(frame.counters);
+    g_gpuSlowDraws += draws;
+
+    for (size_t i = 0; i < frame.passes.size(); i++)
+    {
+        PassProfilerTotal* total = FindPassTotal(g_gpuSlowPassTotals, frame.passes[i], ordinals[i], true);
+        total->gpuMs += passMs[i];
+        total->draws += frame.passes[i].draws;
+    }
+
+    if (g_gpuSlowestFrames.size() == GPU_SLOW_FRAMES_LISTED && gpuFrameMs <= g_gpuSlowestFrames.back().ms)
+        return;
+
+    GpuSlowFrame slow;
+    slow.ms = gpuFrameMs;
+    slow.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_passProfilerStartTime).count();
+    slow.frameNumber = g_passProfilerFrameNumber;
+    slow.draws = draws;
+    slow.counters = frame.counters;
+
+    // Its six most expensive passes of 0.3 ms or more.
+    std::vector<size_t> order(frame.passes.size());
+    std::iota(order.begin(), order.end(), size_t(0));
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return passMs[a] > passMs[b]; });
+    for (size_t i = 0; i < order.size() && i < 6 && passMs[order[i]] >= 0.3; i++)
+    {
+        const size_t pass = order[i];
+        AppendFormat(slow.passes, "%s%.2f %s (%u draws)", i == 0 ? "" : ", ", passMs[pass],
+            PassProfilerDescribe(frame.passes[pass], ordinals[pass]).c_str(), frame.passes[pass].draws);
+    }
+
+    auto position = std::find_if(g_gpuSlowestFrames.begin(), g_gpuSlowestFrames.end(),
+        [&](const GpuSlowFrame& other) { return gpuFrameMs > other.ms; });
+    g_gpuSlowestFrames.insert(position, std::move(slow));
+    if (g_gpuSlowestFrames.size() > GPU_SLOW_FRAMES_LISTED)
+        g_gpuSlowestFrames.pop_back();
+}
+
+static std::string DrawProfilerStateText(uint32_t state)
+{
+    static constexpr const char* Z_FUNC_NAMES[] = { "noZ", "never", "<", "==", "<=", ">", "!=", ">=", "always" };
+    const uint32_t zFunc = std::min<uint32_t>(state >> DRAW_PROFILER_Z_FUNC_SHIFT, std::size(Z_FUNC_NAMES) - 1);
+    return fmt::format("z{}{}{}{}{}{}{}", Z_FUNC_NAMES[zFunc],
+        (state & DRAW_PROFILER_Z_WRITE) != 0 ? " zwrite" : "",
+        (state & DRAW_PROFILER_BLEND) != 0 ? " blend" : "",
+        (state & DRAW_PROFILER_ALPHA_TEST) != 0 ? " alphatest" : "",
+        (state & DRAW_PROFILER_ALPHA_TO_COVERAGE) != 0 ? " a2c" : "",
+        (state & DRAW_PROFILER_REVERSE_Z) != 0 ? " reverseZ" : "",
+        (state & DRAW_PROFILER_INSTANCED) != 0 ? " instanced" : "");
+}
+
+// The slow-frame part of the report: what the slow frames did more than the average frame, pass by pass (and draw
+// group by draw group), and the slowest frames whole.
+static void GpuSlowFramesPrint(double frames, std::string& report)
+{
+    if (g_gpuSlowFrames == 0)
+    {
+        AppendFormat(report, "[gpu slow frames] none of %.0f frames with a GPU frame of %.0f ms or more\n", frames, g_gpuSlowFrameMs);
+        return;
+    }
+
+    const double slowFrames = double(g_gpuSlowFrames);
+    AppendFormat(report, "[gpu slow frames] %u of %.0f frames with a GPU frame of %.0f ms or more (longest %.1f ms, average %.1f ms; "
+        "all frames %.2f ms)\n", g_gpuSlowFrames, frames, g_gpuSlowFrameMs, g_gpuSlowFrameLongestMs,
+        g_gpuSlowFrameMsSum / slowFrames, g_passProfilerFrameMs / frames);
+
+    const auto& s = g_gpuSlowCounters;
+    const auto& a = g_gpuAllCounters;
+    AppendFormat(report, "  per frame, slow vs all: %.0f vs %.0f draws, %.1f vs %.1f resolve copies (%.2f vs %.2f Mpixels), "
+        "%.1f vs %.1f texture updates, %.0f vs %.0f buffer unlocks, %.1f vs %.1f barrier batches (%.1f vs %.1f inside a pass), "
+        "%.0f vs %.0f KB of shader constants, %.2f vs %.2f pipelines created (%.2f vs %.2f ms)\n",
+        double(g_gpuSlowDraws) / slowFrames, double(g_gpuAllDraws) / frames,
+        double(s.resolveCopies) / slowFrames, double(a.resolveCopies) / frames,
+        double(s.resolvePixels) / 1e6 / slowFrames, double(a.resolvePixels) / 1e6 / frames,
+        double(s.textureUpdates) / slowFrames, double(a.textureUpdates) / frames,
+        double(s.bufferUnlocks) / slowFrames, double(a.bufferUnlocks) / frames,
+        double(s.barrierBatches) / slowFrames, double(a.barrierBatches) / frames,
+        double(s.midPassBarrierBatches) / slowFrames, double(a.midPassBarrierBatches) / frames,
+        double(s.constantBytes) / 1024.0 / slowFrames, double(a.constantBytes) / 1024.0 / frames,
+        double(s.pipelines) / slowFrames, double(a.pipelines) / frames, s.pipelineMs / slowFrames, a.pipelineMs / frames);
+
+    struct Row
+    {
+        std::string name;
+        double slowMs, allMs, slowDraws, allDraws;
+    };
+
+    std::vector<Row> rows;
+    for (const auto& slowTotal : g_gpuSlowPassTotals)
+    {
+        const PassProfilerTotal* all = FindPassTotal(g_passProfilerTotals, slowTotal.pass, slowTotal.ordinal, false);
+        rows.push_back(Row{ PassProfilerDescribe(slowTotal.pass, slowTotal.ordinal), slowTotal.gpuMs / slowFrames,
+            all != nullptr ? all->gpuMs / frames : 0.0, double(slowTotal.draws) / slowFrames,
+            all != nullptr ? double(all->draws) / frames : 0.0 });
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const Row& x, const Row& y) { return x.slowMs - x.allMs > y.slowMs - y.allMs; });
+
+    AppendFormat(report, "  passes by the time they add in slow frames (ms per slow frame vs per frame over all frames):\n");
+    for (size_t i = 0; i < rows.size() && i < 16; i++)
+    {
+        const Row& row = rows[i];
+        if (i >= 4 && row.slowMs - row.allMs < 0.1)
+            break;
+
+        AppendFormat(report, "  %+7.2f ms %6.2f vs %6.2f  %-40s draws %5.0f vs %5.0f\n", row.slowMs - row.allMs, row.slowMs,
+            row.allMs, row.name.c_str(), row.slowDraws, row.allDraws);
+    }
+
+    AppendFormat(report, "  slowest frames:\n");
+    for (const auto& frame : g_gpuSlowestFrames)
+    {
+        AppendFormat(report, "    %.1f ms (frame %u, %.1f s): %llu draws, %llu resolve copies, %llu texture updates, %llu buffer "
+            "unlocks, %llu pipelines created (%.1f ms); %s\n", frame.ms, frame.frameNumber, frame.seconds, (unsigned long long)frame.draws,
+            (unsigned long long)frame.counters.resolveCopies, (unsigned long long)frame.counters.textureUpdates,
+            (unsigned long long)frame.counters.bufferUnlocks, (unsigned long long)frame.counters.pipelines,
+            frame.counters.pipelineMs, frame.passes.c_str());
+    }
+
+    if (!g_drawProfilerEnabled || g_drawProfilerSlowTotals.empty())
+        return;
+
+    struct DrawRow
+    {
+        const DrawProfilerKey* key;
+        double slowMs, allMs, slowDraws, allDraws;
+    };
+
+    std::vector<DrawRow> drawRows;
+    drawRows.reserve(g_drawProfilerSlowTotals.size());
+    for (const auto& [key, slowTotal] : g_drawProfilerSlowTotals)
+    {
+        auto all = g_drawProfilerTotals.find(key);
+        const bool found = all != g_drawProfilerTotals.end();
+        drawRows.push_back(DrawRow{ &key, slowTotal.gpuMs / slowFrames, found ? all->second.gpuMs / frames : 0.0,
+            double(slowTotal.draws) / slowFrames, found ? double(all->second.draws) / frames : 0.0 });
+    }
+
+    std::sort(drawRows.begin(), drawRows.end(),
+        [](const DrawRow& x, const DrawRow& y) { return x.slowMs - x.allMs > y.slowMs - y.allMs; });
+
+    AppendFormat(report, "[gpu slow draws] draw groups by the time they add in slow frames (ms and draws per slow frame vs per frame "
+        "over all frames):\n");
+    for (size_t i = 0; i < drawRows.size() && i < 24; i++)
+    {
+        const DrawRow& row = drawRows[i];
+        if (i >= 4 && row.slowMs - row.allMs < 0.05)
+            break;
+
+        const DrawProfilerKey& key = *row.key;
+        PassProfilerPass pass{};
+        pass.width = key.width;
+        pass.height = key.height;
+        pass.colorFormat = key.colorFormat;
+        pass.depthFormat = key.depthFormat;
+        pass.samples = key.samples;
+        const std::string pixelShader = (key.state & DRAW_PROFILER_NO_PIXEL_SHADER) != 0 ?
+            std::string("none") : DrawProfilerShaderName(key.pixelShader, key.pixelSpirv);
+
+        AppendFormat(report, "  %+7.3f ms %6.3f vs %6.3f  %5.1f vs %5.1f draws  %s  ps %s vs %s %s\n", row.slowMs - row.allMs,
+            row.slowMs, row.allMs, row.slowDraws, row.allDraws, PassProfilerDescribe(pass, key.ordinal).c_str(),
+            pixelShader.c_str(), DrawProfilerShaderName(key.vertexShader, key.vertexSpirv).c_str(),
+            DrawProfilerStateText(key.state).c_str());
+    }
+}
+
 // Called once the frame's fence has been waited on, so its timestamps are final.
 static void PassProfilerCollect(double gpuFrameMs)
 {
@@ -1330,6 +1674,8 @@ static void PassProfilerCollect(double gpuFrameMs)
 
     // Group by target description and by the order among passes with the same description.
     std::vector<uint32_t> ordinals(frame.passes.size());
+    std::vector<double> passMs(frame.passes.size());
+    uint64_t frameDraws = 0;
     for (size_t i = 0; i < frame.passes.size(); i++)
     {
         const auto& pass = frame.passes[i];
@@ -1346,29 +1692,21 @@ static void PassProfilerCollect(double gpuFrameMs)
             }
         }
         ordinals[i] = ordinal;
+        passMs[i] = ms;
+        frameDraws += pass.draws;
 
-        PassProfilerTotal* total = nullptr;
-        for (auto& candidate : g_passProfilerTotals)
-        {
-            const auto& p = candidate.pass;
-            if (candidate.ordinal == ordinal && p.width == pass.width && p.height == pass.height &&
-                p.colorFormat == pass.colorFormat && p.depthFormat == pass.depthFormat && p.samples == pass.samples &&
-                p.kind == pass.kind)
-            {
-                total = &candidate;
-                break;
-            }
-        }
-
-        if (total == nullptr)
-        {
-            g_passProfilerTotals.push_back(PassProfilerTotal{ pass, ordinal, 0.0, 0 });
-            total = &g_passProfilerTotals.back();
-        }
-
+        PassProfilerTotal* total = FindPassTotal(g_passProfilerTotals, pass, ordinal, true);
         total->gpuMs += ms;
         total->draws += pass.draws;
     }
+
+    // SwitchGpuSlowFrameMs.
+    g_passProfilerFrameNumber++;
+    g_gpuAllCounters.Add(frame.counters);
+    g_gpuAllDraws += frameDraws;
+    const bool slowFrame = g_gpuSlowFrameMs > 0.0 && gpuFrameMs >= g_gpuSlowFrameMs;
+    if (slowFrame)
+        PassProfilerTakeSlowFrame(frame, ordinals, passMs, frameDraws, gpuFrameMs);
 
     if (g_drawProfilerEnabled && !frame.draws.empty())
     {
@@ -1410,6 +1748,14 @@ static void PassProfilerCollect(double gpuFrameMs)
             total.gpuMs += ms;
             total.draws++;
             total.count += draw.count;
+
+            if (slowFrame)
+            {
+                auto& slowTotal = g_drawProfilerSlowTotals[key];
+                slowTotal.gpuMs += ms;
+                slowTotal.draws++;
+                slowTotal.count += draw.count;
+            }
         }
     }
 
@@ -1467,6 +1813,8 @@ static void PassProfilerCollect(double gpuFrameMs)
         "lookups answered from their caches\n",
         double(g_profilerStatesSkipped.load(std::memory_order_relaxed)) / frames, double(g_profilerPipelineCacheHits) / frames,
         double(g_profilerSamplerCacheHits) / frames);
+    AppendFormat(report, "  pipelines the render thread created for a draw: %u, %.1f ms in all, the longest %.1f ms (round 12)\n",
+        g_profilerRenderThreadPipelines, g_profilerRenderThreadPipelineMs, g_profilerRenderThreadPipelineLongestMs);
 
     // Taken (and reset) under the lock: with SwitchPresentOnRenderThread both threads add to them.
     double frameTimes[FRAME_TIME_COUNT];
@@ -1492,6 +1840,12 @@ static void PassProfilerCollect(double gpuFrameMs)
             frameTimes[FRAME_TIME_GPU] / timedFrames, frameTimes[FRAME_TIME_ACQUIRE] / timedFrames,
             frameTimes[FRAME_TIME_LIMITER] / timedFrames,
             g_presentOnRenderThread ? " (presenting, the GPU wait and the next image on the render thread)" : "");
+        if (g_presentWithoutRecordWait)
+        {
+            AppendFormat(report, "  present without the record wait: the wait above is for the previous frame, at the start of Present; "
+                "locks waited %.3f ms per frame for it\n",
+                double(g_presentTailLockWaitNanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6 / timedFrames);
+        }
     }
 
     AppendFormat(report, "  per frame: %.1f colour and %.1f depth restores skipped (copy draws not skipped: %.1f not a draw of vertices "
@@ -1508,6 +1862,14 @@ static void PassProfilerCollect(double gpuFrameMs)
         double(g_profilerDeadCopiesUnknown) / frames, double(g_profilerDeadCopyWaitUs) / 1000.0 / frames,
         double(g_profilerClearsCarried) / frames, double(g_profilerClearsReplaced) / frames,
         double(g_profilerDepthClearsSkipped) / frames, double(g_profilerDepthClearsDeferred) / frames);
+
+    AppendFormat(report, "  per frame (round 15): %.1f resolve copies dropped at submit, %.1f drawn; %.1f draws with a read-only "
+        "depth buffer (%.1f with its resolves only bound); %.1f depth restores aliased, %.1f draws on the alias, %.1f alias "
+        "copies\n",
+        double(g_profilerSubmitCopiesDropped) / frames, double(g_profilerSubmitCopiesKept) / frames,
+        double(g_profilerReadOnlyDepthDraws) / frames, double(g_profilerSampledSlotDraws) / frames,
+        double(g_profilerDepthAliasRestores) / frames, double(g_profilerDepthAliasDraws) / frames,
+        double(g_profilerDepthAliasCopies) / frames);
 
     {
         extern std::atomic<uint32_t> g_switchAudioUnderruns;
@@ -1547,6 +1909,9 @@ static void PassProfilerCollect(double gpuFrameMs)
     if (g_drawProfilerEnabled && !g_drawProfilerTotals.empty())
         DrawProfilerPrint(frames, report);
 
+    if (g_gpuSlowFrameMs > 0.0)
+        GpuSlowFramesPrint(frames, report);
+
     WriteReportAsync(std::move(report));
     g_profilerStreamedBuffers = 0;
     g_profilerCopiedBuffers = 0;
@@ -1578,11 +1943,21 @@ static void PassProfilerCollect(double gpuFrameMs)
     g_profilerDepthClearsDeferred = 0;
     g_profilerDepthClearsSkipped = 0;
     g_profilerDeadCopiesSkipped = 0;
+    g_profilerSubmitCopiesDropped = 0;
+    g_profilerSubmitCopiesKept = 0;
+    g_profilerReadOnlyDepthDraws = 0;
+    g_profilerDepthAliasRestores = 0;
+    g_profilerSampledSlotDraws = 0;
+    g_profilerDepthAliasDraws = 0;
+    g_profilerDepthAliasCopies = 0;
     g_profilerDeadCopiesRead = 0;
     g_profilerDeadCopiesUnknown = 0;
     g_profilerDeadCopyWaitUs = 0;
     g_profilerNoOpDraws = 0;
     g_profilerPipelineCacheHits = 0;
+    g_profilerRenderThreadPipelines = 0;
+    g_profilerRenderThreadPipelineMs = 0.0;
+    g_profilerRenderThreadPipelineLongestMs = 0.0;
     g_profilerSamplerCacheHits = 0;
     g_profilerStatesSkipped.store(0, std::memory_order_relaxed);
     memset(g_profilerRestoresSkipped, 0, sizeof(g_profilerRestoresSkipped));
@@ -1592,6 +1967,17 @@ static void PassProfilerCollect(double gpuFrameMs)
     g_drawProfilerTotals.clear();
     g_passProfilerFrameCount = 0;
     g_passProfilerFrameMs = 0.0;
+
+    g_gpuAllCounters = {};
+    g_gpuSlowCounters = {};
+    g_gpuAllDraws = 0;
+    g_gpuSlowDraws = 0;
+    g_gpuSlowFrames = 0;
+    g_gpuSlowFrameMsSum = 0.0;
+    g_gpuSlowFrameLongestMs = 0.0;
+    g_gpuSlowPassTotals.clear();
+    g_gpuSlowestFrames.clear();
+    g_drawProfilerSlowTotals.clear();
 }
 #endif
 static bool g_commandListStates[NUM_FRAMES];
@@ -2001,7 +2387,15 @@ struct IntermediaryUploadAllocator
     }
 };
 
-static IntermediaryUploadAllocator g_intermediaryUploadAllocator;
+// SwitchPresentWithoutRecordWait: one per frame the render thread may still be recording (see Video::Present). The
+// D3D thread allocates from the current one; without the switch it is always the first.
+static IntermediaryUploadAllocator g_intermediaryUploadAllocators[2];
+static uint32_t g_intermediaryUploadAllocatorIndex = 0;
+
+static IntermediaryUploadAllocator& CurrentIntermediaryUploadAllocator()
+{
+    return g_intermediaryUploadAllocators[g_intermediaryUploadAllocatorIndex];
+}
 
 static std::vector<GuestResource*> g_tempResources[NUM_FRAMES];
 static std::vector<std::unique_ptr<RenderBuffer>> g_tempBuffers[NUM_FRAMES];
@@ -2112,15 +2506,20 @@ static ankerl::unordered_dense::set<GuestSurface*> g_liveSurfaces;
 
 static void ForgetFramebuffersOf(const RenderTexture* image)
 {
+    // (Round 15: with the variant that attaches the depth buffer read-only, keyed by the image with bit 0 set.)
+    const RenderTexture* const keys[] = { image, reinterpret_cast<const RenderTexture*>(reinterpret_cast<uintptr_t>(image) | 1) };
     for (GuestSurface* surface : g_liveSurfaces)
     {
-        auto findResult = surface->framebuffers.find(image);
-        if (findResult != surface->framebuffers.end())
+        for (const RenderTexture* key : keys)
         {
-            if (g_framebuffer == findResult->second.get())
-                g_framebuffer = nullptr;
+            auto findResult = surface->framebuffers.find(key);
+            if (findResult != surface->framebuffers.end())
+            {
+                if (g_framebuffer == findResult->second.get())
+                    g_framebuffer = nullptr;
 
-            surface->framebuffers.erase(findResult);
+                surface->framebuffers.erase(findResult);
+            }
         }
     }
 }
@@ -2409,6 +2808,13 @@ struct RenderCommand
         {
             // SwitchPresentOnRenderThread: the render thread presents and starts the next frame itself.
             bool pipelined;
+            // SwitchPresentWithoutRecordWait: what the gamma pass reads from the game thread's state, as it was
+            // when Present sent the command (the game thread may be in its next frame when the pass is recorded).
+            bool captured;
+            bool xboxColorCorrection;
+            float brightness;
+            uint32_t viewportWidth;
+            uint32_t viewportHeight;
         } executeCommandList;
 #endif
 
@@ -3376,6 +3782,214 @@ static std::unique_ptr<RenderShader> g_copyColorShader;
 static ankerl::unordered_dense::map<RenderFormat, std::unique_ptr<RenderPipeline>> g_copyColorPipelines;
 static std::unique_ptr<RenderPipeline> g_copyDepthPipeline;
 
+#if defined(__SWITCH__)
+// [Switch] Round 15, SwitchSubmitTimeCopies. A resolve copy into a texture is recorded with copy_conditional_vs, which
+// draws it only if a word written just before the frame is submitted says so. The render thread follows each such
+// texture through the rest of the frame: its own image sampled by a draw (the texture in a slot that one of the draw's
+// shaders can read: the translator's sampler masks, every slot for the port's own shaders) or updated from the CPU,
+// or the frame ending first, means the copy is drawn; its image entirely rewritten first in the same frame (by
+// another copy into it, which is drawn or itself never read, or by a hand-over of a surface's image) or the texture
+// destroyed means nothing can read what the copy would have written, and it draws nothing. (While a resolve into the
+// texture waits, its slots sample the surface, not its image.) Every barrier, layout and pass is recorded as before.
+static bool g_submitTimeCopies = false;
+static constexpr uint32_t CONDITIONAL_COPY_SLOTS = 256;
+
+// [Switch] Round 15, ported from MarathonRecomp-NX: SwitchCopyKeepsVertexConstants, SwitchQueryResetPerQuery and
+// SwitchReadOnlyDepthSampling (see where each is used); and SwitchSampledSlotResolves, the translator's sampler masks
+// in the lazy depth resolves.
+static bool g_copyKeepsVertexConstants = false;
+static bool g_queryResetPerQuery = false;
+static bool g_sampledSlotResolves = false;
+static bool g_readOnlyDepthSampling = false;
+static bool g_depthReadOnly = false;               // the draw being flushed attaches its depth buffer read-only
+static bool g_lastFramebufferDepthReadOnly = false; // how the framebuffer the last draw selected attaches it
+static std::unique_ptr<RenderBuffer> g_conditionalCopyBuffers[NUM_FRAMES];
+static uint32_t* g_conditionalCopyWords[NUM_FRAMES];
+static uint64_t g_conditionalCopyAddresses[NUM_FRAMES];
+static std::unique_ptr<RenderShader> g_copyConditionalShader;
+static ankerl::unordered_dense::map<RenderFormat, std::unique_ptr<RenderPipeline>> g_conditionalCopyColorPipelines;
+static std::unique_ptr<RenderPipeline> g_conditionalCopyDepthPipeline;
+
+// A copy into a texture (a resolve), or into a surface (SwitchDepthRestoreAlias's copy of the aliased depth).
+struct ConditionalCopy
+{
+    const GuestTexture* texture;
+    const GuestSurface* surface;
+    uint32_t slot;
+    bool decided;
+    bool drawn;
+};
+
+// This frame's, in recording order (the slot is the index).
+static std::vector<ConditionalCopy> g_conditionalCopies;
+
+// The texture slots a shader can sample (every slot for one of the port's own, which has no cache entry).
+static uint32_t TextureSlotsRead(const GuestShader* shader)
+{
+    if (shader == nullptr || shader->shaderCacheEntry == nullptr)
+        return 0xFFFF;
+
+    return shader->shaderCacheEntry->textureSlotsRead & 0xFFFF;
+}
+
+// The texture's image is rewritten entirely, or the texture is destroyed: its copies of this frame not decided yet
+// are never read.
+static void NoteConditionalCopyRewrite(const GuestTexture* texture)
+{
+    for (ConditionalCopy& copy : g_conditionalCopies)
+    {
+        if (!copy.decided && copy.texture == texture)
+        {
+            copy.decided = true;
+            copy.drawn = false;
+        }
+    }
+}
+
+// The texture's image may be read: its copies of this frame not decided yet are drawn.
+static void NoteConditionalCopyRead(const GuestTexture* texture)
+{
+    for (ConditionalCopy& copy : g_conditionalCopies)
+    {
+        if (!copy.decided && copy.texture == texture)
+        {
+            copy.decided = true;
+            copy.drawn = true;
+        }
+    }
+}
+
+// Before a draw (its resolves and hand-overs done): the followed textures whose own image is in a slot that one of
+// its shaders can read.
+static void NoteConditionalCopyReads()
+{
+    const uint32_t slots = TextureSlotsRead(g_pipelineState.vertexShader) | TextureSlotsRead(g_pipelineState.pixelShader);
+    for (ConditionalCopy& copy : g_conditionalCopies)
+    {
+        if (copy.decided || copy.texture == nullptr || copy.texture->sourceSurface != nullptr)
+            continue;
+
+        for (uint32_t i = 0; i < std::size(g_textures); i++)
+        {
+            if ((slots & (1u << i)) != 0 && g_textures[i] == copy.texture)
+            {
+                copy.decided = true;
+                copy.drawn = true;
+                break;
+            }
+        }
+    }
+}
+
+static bool CanCopyConditionally(const GuestTexture* texture)
+{
+    return g_submitTimeCopies && texture->patchedTexture == nullptr && texture->recreatedCubeMapTexture == nullptr &&
+        g_conditionalCopies.size() < CONDITIONAL_COPY_SLOTS;
+}
+
+// The word of a copy into `texture` (drawn unless decided otherwise at submit).
+static uint32_t BeginConditionalCopy(const GuestTexture* texture)
+{
+    const uint32_t slot = uint32_t(g_conditionalCopies.size());
+    g_conditionalCopyWords[g_frame][slot] = 1;
+    g_conditionalCopies.push_back({ texture, nullptr, slot, false, true });
+    return slot;
+}
+
+// The same for a copy into a depth surface (SwitchDepthRestoreAlias): drawn if anything uses the surface before a
+// depth clear (which rewrites every pixel) or its destruction in the same frame.
+static uint32_t BeginConditionalSurfaceCopy(const GuestSurface* surface)
+{
+    const uint32_t slot = uint32_t(g_conditionalCopies.size());
+    g_conditionalCopyWords[g_frame][slot] = 1;
+    g_conditionalCopies.push_back({ nullptr, surface, slot, false, true });
+    return slot;
+}
+
+static void NoteConditionalSurfaceUse(const GuestSurface* surface)
+{
+    if (surface == nullptr)
+        return;
+
+    for (ConditionalCopy& copy : g_conditionalCopies)
+    {
+        if (!copy.decided && copy.surface == surface)
+        {
+            copy.decided = true;
+            copy.drawn = true;
+        }
+    }
+}
+
+static void NoteConditionalSurfaceRewrite(const GuestSurface* surface)
+{
+    if (surface == nullptr)
+        return;
+
+    for (ConditionalCopy& copy : g_conditionalCopies)
+    {
+        if (!copy.decided && copy.surface == surface)
+        {
+            copy.decided = true;
+            copy.drawn = false;
+        }
+    }
+}
+
+// [Switch] Round 15, SwitchDepthRestoreAlias (see TryDepthRestoreAlias): the depth buffer a restore draw would have
+// filled with another depth buffer's values, standing for that buffer until the two would differ.
+struct DepthAlias
+{
+    GuestSurface* target = nullptr;
+    GuestSurface* source = nullptr;
+};
+
+static bool g_depthRestoreAlias = false;
+static DepthAlias g_depthAlias;
+static void MaterializeDepthAlias(bool conditional);
+
+static RenderPipeline* ConditionalCopyPipeline(RenderFormat format)
+{
+    if (format == RenderFormat::D32_FLOAT)
+        return g_conditionalCopyDepthPipeline.get();
+
+    auto& pipeline = g_conditionalCopyColorPipelines[format];
+    if (pipeline == nullptr)
+    {
+        RenderGraphicsPipelineDesc desc;
+        desc.pipelineLayout = g_pipelineLayout.get();
+        desc.vertexShader = g_copyConditionalShader.get();
+        desc.pixelShader = g_copyColorShader.get();
+        desc.renderTargetFormat[0] = format;
+        desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+        desc.renderTargetCount = 1;
+        pipeline = g_device->createGraphicsPipeline(desc);
+    }
+
+    return pipeline.get();
+}
+
+// Just before the frame is submitted: each copy's word (a copy still followed at the end of the frame is drawn).
+static void FinishConditionalCopies()
+{
+    if (g_conditionalCopies.empty())
+        return;
+
+    uint32_t* words = g_conditionalCopyWords[g_frame];
+    for (const ConditionalCopy& copy : g_conditionalCopies)
+    {
+        const bool drawn = !copy.decided || copy.drawn;
+        words[copy.slot] = drawn ? 1 : 0;
+        if (drawn)
+            g_profilerSubmitCopiesKept++;
+        else
+            g_profilerSubmitCopiesDropped++;
+    }
+
+    g_conditionalCopies.clear();
+}
+#endif
+
 static std::unique_ptr<RenderShader> g_resolveMsaaColorShaders[3];
 static ankerl::unordered_dense::map<RenderFormat, std::array<std::unique_ptr<RenderPipeline>, 3>> g_resolveMsaaColorPipelines;
 static std::unique_ptr<RenderPipeline> g_resolveMsaaDepthPipelines[3];
@@ -3788,6 +4402,17 @@ static void BeginCommandList()
     auto& commandList = g_commandLists[g_frame];
 
     commandList->begin();
+#if defined(__SWITCH__)
+    // [Switch] Round 15, SwitchQueryResetPerQuery (from MarathonRecomp-NX). NVK resets several timestamp queries at once
+    // with a copy-engine fill, which switches the channel to the copy engine and back at the start of every frame; a
+    // single query is reset with a 3D-engine semaphore write. Each query is still reset before it is written.
+    if (g_queryResetPerQuery)
+    {
+        for (uint32_t i = 0; i < NUM_QUERIES; i++)
+            commandList->resetQueryPool(g_queryPools[g_frame].get(), i, 1);
+    }
+    else
+#endif
     commandList->resetQueryPool(g_queryPools[g_frame].get(), 0, NUM_QUERIES);
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 0);
 #if defined(__SWITCH__)
@@ -4029,7 +4654,9 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     os::switch_stall_watch::SetStateReporter(ReportRendererState);
 
     g_drawProfilerEnabled = Config::SwitchGpuDrawProfiler;
-    g_passProfilerEnabled = Config::SwitchGpuPassProfiler || g_drawProfilerEnabled;
+    // The slow-frame report (round 13) needs the pass timestamps: it turns the pass profiler on by itself.
+    g_gpuSlowFrameMs = double(std::max<int32_t>(0, Config::SwitchGpuSlowFrameMs));
+    g_passProfilerEnabled = Config::SwitchGpuPassProfiler || g_drawProfilerEnabled || g_gpuSlowFrameMs > 0.0;
     if (g_passProfilerEnabled)
     {
         for (auto& frame : g_passProfilerFrames)
@@ -4234,7 +4861,14 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     g_pipelineLookupCache = Config::SwitchPipelineLookupCache;
     g_samplerCache = Config::SwitchSamplerCache;
     g_skipDeadCopies = Config::SwitchSkipDeadCopies;
+    g_submitTimeCopies = g_vulkan && Config::SwitchSubmitTimeCopies;
+    g_queryResetPerQuery = Config::SwitchQueryResetPerQuery;
+    g_sampledSlotResolves = Config::SwitchSampledSlotResolves;
+    g_readOnlyDepthSampling = g_vulkan && Config::SwitchReadOnlyDepthSampling;
+    g_depthRestoreAlias = g_vulkan && Config::SwitchDepthRestoreAlias;
     g_presentOnRenderThread = Config::SwitchPresentOnRenderThread;
+    g_presentWithoutRecordWait = g_presentOnRenderThread && Config::SwitchPresentWithoutRecordWait;
+    g_perResourceLockWait = Config::SwitchPerResourceLockWait;
     g_carryClears = g_skipOverwrittenClears && Config::SwitchCarryClears;
     g_deferDepthClears = Config::SwitchSkipOverwrittenDepthClears;
     g_eagerDepthTransitions = Config::SwitchEagerDepthTransitions;
@@ -4247,6 +4881,14 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 #ifdef UNLEASHED_RECOMP_CONSTANTS_UBO
     g_constantsUbo = g_vulkan && Config::SwitchConstantsUBO;
     g_constantsUboSpecBit = g_constantsUbo ? SPEC_CONSTANT_CONSTANTS_UBO : 0;
+#if defined(__SWITCH__)
+    g_copyKeepsVertexConstants = g_constantsUbo && Config::SwitchCopyKeepsVertexConstants;
+    fprintf(stderr, "Switch round 15 GPU: resolve copies decided at submit %s, copies keep the vertex constants %s, frame "
+        "queries reset one by one %s, lazy depth resolves by sampled slots %s, read-only depth sampling %s, depth restores "
+        "aliased %s\n",
+        g_submitTimeCopies ? "on" : "off", g_copyKeepsVertexConstants ? "on" : "off", g_queryResetPerQuery ? "on" : "off",
+        g_sampledSlotResolves ? "on" : "off", g_readOnlyDepthSampling ? "on" : "off", g_depthRestoreAlias ? "on" : "off");
+#endif
 
 #if defined(__SWITCH__)
     // One line per run saying which renderer changes were active, for comparing runs.
@@ -4326,6 +4968,23 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         "render thread priority 0x%X, guest spin locks spin before sleeping %s\n",
         g_presentOnRenderThread ? "on" : "off", g_idleRenderThreadBatches ? "on" : "off",
         uint32_t(Config::SwitchRenderThreadPriority), Config::SwitchGuestSpinBeforeSleep ? "on" : "off");
+    fprintf(stderr, "Switch round 11 CPU: present without the record wait %s; native message dispatch %s%s, exact type "
+        "comparisons %s; native map find %s, quaternion decoder %s, bone palette %s, layer mask test %s%s; mixer reverb %s, "
+        "mix kernels %s, voice kernels %s%s; fast LZX %s, pipeline cache saved on misses %s (after compiles %s), native "
+        "find file %s, native file sizes %s (code generation: see the build id)\n",
+        g_presentWithoutRecordWait ? "on" : "off", Config::SwitchNativeMessageDispatch ? "on" : "off",
+        Config::SwitchVerifyMessageDispatch ? " (verified)" : "", Config::SwitchExactTypeInfoSet ? "on" : "off",
+        Config::SwitchNativeMapFind ? "on" : "off", Config::SwitchNativeQuatDecode ? "on" : "off",
+        Config::SwitchNativeBonePalette ? "on" : "off", Config::SwitchNativeLayerMaskTest ? "on" : "off",
+        Config::SwitchVerifyNativeHotFunctions ? " (verified)" : "", Config::SwitchNativeReverb ? "on" : "off",
+        Config::SwitchNativeMixKernels ? "on" : "off", Config::SwitchNativeVoiceKernels ? "on" : "off",
+        Config::SwitchVerifyNativeAudio ? " (verified)" : "", Config::SwitchFastNativeDecompress ? "on" : "off",
+        Config::SwitchPipelineCacheSaveOnMiss ? "on" : "off", Config::SwitchPipelineCacheSaveAfterCompiles ? "on" : "off",
+        Config::SwitchNativeFindFile ? "on" : "off", Config::SwitchNativeFileHandles ? "on" : "off");
+    fprintf(stderr, "Switch round 14 CPU: targeted dispatcher wakeups %s, semaphore releases wake one %s, UI modifier "
+        "index %s (code generation: see the build id)\n",
+        Config::SwitchTargetedDispatcherWakeups ? "on" : "off", Config::SwitchSemaphoreWakeOne ? "on" : "off",
+        Config::SwitchModifierIndex ? "on" : "off");
 #else
         "n/a");
 #endif
@@ -4400,6 +5059,27 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     desc.depthWriteEnabled = true;
     desc.depthTargetFormat = RenderFormat::D32_FLOAT;
     g_copyDepthPipeline = g_device->createGraphicsPipeline(desc);
+
+#if defined(__SWITCH__)
+    // (Also SwitchDepthRestoreAlias's copies, decided at submit the same way.)
+    if (g_submitTimeCopies || g_depthRestoreAlias)
+    {
+        g_copyConditionalShader = CREATE_SHADER(copy_conditional_vs);
+        desc.vertexShader = g_copyConditionalShader.get();
+        g_conditionalCopyDepthPipeline = g_device->createGraphicsPipeline(desc);
+
+        for (uint32_t i = 0; i < NUM_FRAMES; i++)
+        {
+            g_conditionalCopyBuffers[i] = g_device->createBuffer(RenderBufferDesc::UploadBuffer(CONDITIONAL_COPY_SLOTS * sizeof(uint32_t),
+                RenderBufferFlag::CONSTANT));
+            g_conditionalCopyWords[i] = reinterpret_cast<uint32_t*>(g_conditionalCopyBuffers[i]->map());
+            g_conditionalCopyAddresses[i] = g_conditionalCopyBuffers[i]->getDeviceAddress();
+            std::fill_n(g_conditionalCopyWords[i], CONDITIONAL_COPY_SLOTS, 1u);
+        }
+
+        g_conditionalCopies.reserve(CONDITIONAL_COPY_SLOTS);
+    }
+#endif
 
     g_resolveMsaaColorShaders[0] = CREATE_SHADER(resolve_msaa_color_2x);
     g_resolveMsaaColorShaders[1] = CREATE_SHADER(resolve_msaa_color_4x);
@@ -4584,7 +5264,17 @@ static void ProcDestructResource(const RenderCommand& cmd)
 {
     const auto& args = cmd.destructResource;
 #if defined(__SWITCH__)
+    // SwitchDepthRestoreAlias: the target goes (nothing to copy), or the source (the target gets its copy first).
+    if (args.resource == static_cast<const GuestResource*>(g_depthAlias.target))
+        g_depthAlias = {};
+    else if (args.resource == static_cast<const GuestResource*>(g_depthAlias.source))
+        MaterializeDepthAlias(true);
+
     ForgetPendingResolves(args.resource);
+    if (args.resource->type == ResourceType::Texture || args.resource->type == ResourceType::VolumeTexture)
+        NoteConditionalCopyRewrite(reinterpret_cast<const GuestTexture*>(args.resource));
+    if (args.resource->type == ResourceType::RenderTarget || args.resource->type == ResourceType::DepthStencil)
+        NoteConditionalSurfaceRewrite(reinterpret_cast<const GuestSurface*>(args.resource));
 #endif
     g_tempResources[g_frame].push_back(args.resource);
 }
@@ -4598,25 +5288,71 @@ static uint32_t ComputeTexturePitch(GuestTexture* texture)
 // SwitchPresentOnRenderThread: before the D3D thread writes a buffer's or texture's memory again (a lock), the
 // render thread has finished presenting the previous frame and processes this frame's commands as they come,
 // as without it: an earlier unlock of the same memory is copied from it before the new contents can land.
-static void WaitForPresentTail()
+static void WaitForPresentTail(bool fromLock = true)
 {
     const uint32_t sent = g_presentTailsSent.load(std::memory_order_acquire);
     uint32_t done = g_presentTailsDone.load(std::memory_order_acquire);
     if (done == sent || !IsPresentThread())
         return;
 
+    const auto start = std::chrono::steady_clock::now();
     while (done != sent)
     {
         g_presentTailsDone.wait(done, std::memory_order_acquire);
         done = g_presentTailsDone.load(std::memory_order_acquire);
     }
+
+    // SwitchPresentWithoutRecordWait moves Present's wait for the render thread here when a lock comes early.
+    if (fromLock)
+    {
+        g_presentTailLockWaitNanoseconds.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+}
+
+// [Switch] Round 13, SwitchPerResourceLockWait. What a lock must not overtake is the render thread's copy of an earlier
+// frame's unlock of the same buffer or texture (it reads mappedMemory when it gets to the command). Each object counts
+// its unlocks sent and not copied yet and remembers the Present count of its last one, and a lock waits only for its
+// own, and only when that last unlock was sent before the latest Present: no longer for the whole tail of the previous
+// Present (every other object's unlocks and the frame's draws). As before, a lock never waits for the frame being
+// recorded, and only the D3D thread waits. The waiter count lets the render thread skip the wake-up when nobody waits;
+// both sides use sequentially consistent operations, so a waiter that saw a pending unlock is woken (the decrement
+// either comes before its look, or sees the waiter).
+static std::atomic<uint32_t> g_unlockWaiters{ 0 };
+
+static void WaitForPendingUnlocks(std::atomic<uint32_t>& pending, uint32_t unlockSerial)
+{
+    if (!IsPresentThread() || unlockSerial == g_presentTailsSent.load(std::memory_order_relaxed))
+        return;
+
+    uint32_t value = pending.load(std::memory_order_seq_cst);
+    if (value == 0)
+        return;
+
+    const auto start = std::chrono::steady_clock::now();
+    g_unlockWaiters.fetch_add(1, std::memory_order_seq_cst);
+    while ((value = pending.load(std::memory_order_seq_cst)) != 0)
+        pending.wait(value, std::memory_order_seq_cst);
+    g_unlockWaiters.fetch_sub(1, std::memory_order_seq_cst);
+
+    g_presentTailLockWaitNanoseconds.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
+static void FinishPendingUnlock(std::atomic<uint32_t>& pending)
+{
+    if (pending.fetch_sub(1, std::memory_order_seq_cst) == 1 && g_unlockWaiters.load(std::memory_order_seq_cst) != 0)
+        pending.notify_all();
 }
 #endif
 
 static void LockTextureRect(GuestTexture* texture, uint32_t, GuestLockedRect* lockedRect)
 {
 #if defined(__SWITCH__)
-    WaitForPresentTail();
+    if (g_perResourceLockWait)
+        WaitForPendingUnlocks(texture->pendingUnlocks.value, texture->unlockSerial);
+    else
+        WaitForPresentTail();
 #endif
     uint32_t pitch = ComputeTexturePitch(texture);
     uint32_t slicePitch = pitch * texture->height;
@@ -4635,6 +5371,10 @@ static void UnlockTextureRect(GuestTexture* texture)
     RenderCommand cmd;
     cmd.type = RenderCommandType::UnlockTextureRect;
     cmd.unlockTextureRect.texture = texture;
+#if defined(__SWITCH__)
+    texture->pendingUnlocks.value.fetch_add(1, std::memory_order_seq_cst);
+    texture->unlockSerial = g_presentTailsSent.load(std::memory_order_relaxed);
+#endif
     EnqueueRenderCommand(cmd, true);
 }
 
@@ -4644,6 +5384,7 @@ static void ProcUnlockTextureRect(const RenderCommand& cmd)
 
 #if defined(__SWITCH__)
     g_profilerTextureUpdates++;
+    NoteConditionalCopyRead(args.texture);
 
     // A copy kept pending over a Present (SwitchKeepResolvesPending) was made before this update.
     if (args.texture->sourceSurface != nullptr && args.texture->pendingCarried)
@@ -4658,6 +5399,9 @@ static void ProcUnlockTextureRect(const RenderCommand& cmd)
 
     auto allocation = g_uploadAllocators[g_frame].allocate(slicePitch, PLACEMENT_ALIGNMENT);
     memcpy(allocation.memory, args.texture->mappedMemory, slicePitch);
+#if defined(__SWITCH__)
+    FinishPendingUnlock(args.texture->pendingUnlocks.value);
+#endif
 
     g_commandLists[g_frame]->copyTextureRegion(
         RenderTextureCopyLocation::Subresource(args.texture->texture, 0),
@@ -4667,7 +5411,10 @@ static void ProcUnlockTextureRect(const RenderCommand& cmd)
 static void* LockBuffer(GuestBuffer* buffer, uint32_t flags)
 {
 #if defined(__SWITCH__)
-    WaitForPresentTail();
+    if (g_perResourceLockWait)
+        WaitForPendingUnlocks(buffer->pendingUnlocks.value, buffer->unlockSerial);
+    else
+        WaitForPresentTail();
 #endif
     buffer->lockedReadOnly = (flags & 0x10) != 0;
 
@@ -4879,6 +5626,10 @@ static void UnlockBuffer(GuestBuffer* buffer)
             RenderCommand cmd;
             cmd.type = (sizeof(T) == 2) ? RenderCommandType::UnlockBuffer16 : RenderCommandType::UnlockBuffer32;
             cmd.unlockBuffer.buffer = buffer;
+#if defined(__SWITCH__)
+            buffer->pendingUnlocks.value.fetch_add(1, std::memory_order_seq_cst);
+            buffer->unlockSerial = g_presentTailsSent.load(std::memory_order_relaxed);
+#endif
             EnqueueRenderCommand(cmd, true);
         }
         else
@@ -4891,11 +5642,17 @@ static void UnlockBuffer(GuestBuffer* buffer)
 static void ProcUnlockBuffer16(const RenderCommand& cmd)
 {
     UnlockBuffer<uint16_t>(cmd.unlockBuffer.buffer, false);
+#if defined(__SWITCH__)
+    FinishPendingUnlock(cmd.unlockBuffer.buffer->pendingUnlocks.value);
+#endif
 }
 
 static void ProcUnlockBuffer32(const RenderCommand& cmd)
 {
     UnlockBuffer<uint32_t>(cmd.unlockBuffer.buffer, false);
+#if defined(__SWITCH__)
+    FinishPendingUnlock(cmd.unlockBuffer.buffer->pendingUnlocks.value);
+#endif
 }
 
 static void UnlockVertexBuffer(GuestBuffer* buffer)
@@ -5486,6 +6243,7 @@ static std::chrono::steady_clock::time_point g_frameTimeLastPresentEnd;
 void Video::Present()
 {
 #if defined(__SWITCH__)
+    os::switch_cpu_profiler::FrameWorkEnd();
     auto frameTimeLap = std::chrono::steady_clock::now();
     double frameTimes[FRAME_TIME_COUNT]{};
     if (g_frameTimeLastPresentEnd.time_since_epoch().count() != 0)
@@ -5497,6 +6255,17 @@ void Video::Present()
 #if defined(__SWITCH__)
     // SwitchPresentOnRenderThread: decided per frame and sent with the command, so both threads agree.
     const bool pipelined = g_presentOnRenderThread && g_gamePresenting.load(std::memory_order_acquire);
+
+    // SwitchPresentWithoutRecordWait: Present no longer waits for the render thread to record the frame it sends
+    // (below); instead the previous frame is recorded, submitted and presented before this one builds its ImGui
+    // draw data (which the previous frame's DrawImGui command reads), reads the swap chain's size or reuses the
+    // previous frame's intermediary copies. The render thread had a whole frame for that, so this rarely waits.
+    const bool withoutRecordWait = pipelined && g_presentWithoutRecordWait;
+    if (withoutRecordWait)
+    {
+        WaitForPresentTail(false);
+        frameTimes[FRAME_TIME_RENDER_THREAD] = FrameTimeLap(frameTimeLap);
+    }
 #endif
 
     RenderCommand cmd;
@@ -5508,6 +6277,14 @@ void Video::Present()
     cmd.type = RenderCommandType::ExecuteCommandList;
 #if defined(__SWITCH__)
     cmd.executeCommandList.pipelined = pipelined;
+    cmd.executeCommandList.captured = withoutRecordWait;
+    if (withoutRecordWait)
+    {
+        cmd.executeCommandList.xboxColorCorrection = Config::XboxColorCorrection;
+        cmd.executeCommandList.brightness = Config::Brightness;
+        cmd.executeCommandList.viewportWidth = Video::s_viewportWidth;
+        cmd.executeCommandList.viewportHeight = Video::s_viewportHeight;
+    }
     if (pipelined)
         g_presentTailsSent.fetch_add(1, std::memory_order_acq_rel);
 #endif
@@ -5523,15 +6300,28 @@ void Video::Present()
 #if defined(__SWITCH__)
     if (pipelined)
     {
-        // The render thread has read everything this frame sent (this thread's copies of shader constants and
-        // vertices included); it submits, presents and gets the next frame ready (PresentOnRenderThread).
-        g_recordedCommandList.wait(false);
-        g_recordedCommandList = false;
-        frameTimes[FRAME_TIME_RENDER_THREAD] = FrameTimeLap(frameTimeLap);
+        if (withoutRecordWait)
+        {
+            // The render thread records this frame while this thread goes on: its copies stay in the current
+            // allocator, and the next frame's go to the other one, whose frame was recorded before the wait at
+            // the start of Present returned.
+            g_intermediaryUploadAllocatorIndex ^= 1;
+            CurrentIntermediaryUploadAllocator().reset();
+            frameTimes[FRAME_TIME_RENDER_THREAD] += FrameTimeLap(frameTimeLap);
+        }
+        else
+        {
+            // The render thread has read everything this frame sent (this thread's copies of shader constants
+            // and vertices included); it submits, presents and gets the next frame ready (PresentOnRenderThread).
+            g_recordedCommandList.wait(false);
+            g_recordedCommandList = false;
+            frameTimes[FRAME_TIME_RENDER_THREAD] = FrameTimeLap(frameTimeLap);
+        }
 
         os::switch_overlay::OnPresent(Video::s_viewportWidth, Video::s_viewportHeight);
         UpdatePipelineCacheSaving();
-        g_intermediaryUploadAllocator.reset();
+        if (!withoutRecordWait)
+            CurrentIntermediaryUploadAllocator().reset();
     }
     else
     {
@@ -5593,7 +6383,8 @@ void Video::Present()
 
     g_dirtyStates = DirtyStates(true);
     g_uploadAllocators[g_frame].reset();
-    g_intermediaryUploadAllocator.reset();
+    for (auto& allocator : g_intermediaryUploadAllocators)
+        allocator.reset();
     g_triangleFanIndexData.reset();
     g_quadIndexData.reset();
 
@@ -5644,6 +6435,7 @@ void Video::Present()
 
     frameTimes[FRAME_TIME_LIMITER] = FrameTimeLap(frameTimeLap);
     g_frameTimeLastPresentEnd = frameTimeLap;
+    os::switch_cpu_profiler::FrameWorkStart();
     if (frameTimes[FRAME_TIME_WORK] != 0.0)
     {
         std::lock_guard lock(g_frameTimesMutex);
@@ -5760,7 +6552,21 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
                 int32_t viewportHeight;
             } constants;
 
-            if (Config::XboxColorCorrection)
+            bool xboxColorCorrection = Config::XboxColorCorrection;
+            float brightness = Config::Brightness;
+            uint32_t viewportWidth = Video::s_viewportWidth;
+            uint32_t viewportHeight = Video::s_viewportHeight;
+#if defined(__SWITCH__)
+            if (cmd.executeCommandList.captured)
+            {
+                xboxColorCorrection = cmd.executeCommandList.xboxColorCorrection;
+                brightness = cmd.executeCommandList.brightness;
+                viewportWidth = cmd.executeCommandList.viewportWidth;
+                viewportHeight = cmd.executeCommandList.viewportHeight;
+            }
+#endif
+
+            if (xboxColorCorrection)
             {
                 constants.gammaR = 1.2f;
                 constants.gammaG = 1.17f;
@@ -5773,17 +6579,17 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
                 constants.gammaB = 1.0f;
             }
 
-            float offset = (Config::Brightness - 0.5f) * 1.2f;
+            float offset = (brightness - 0.5f) * 1.2f;
 
             constants.gammaR = 1.0f / std::clamp(constants.gammaR + offset, 0.1f, 4.0f);
             constants.gammaG = 1.0f / std::clamp(constants.gammaG + offset, 0.1f, 4.0f);
             constants.gammaB = 1.0f / std::clamp(constants.gammaB + offset, 0.1f, 4.0f);
             constants.textureDescriptorIndex = g_intermediaryBackBufferTextureDescriptorIndex;
 
-            constants.viewportOffsetX = (int32_t(g_swapChain->getWidth()) - int32_t(Video::s_viewportWidth)) / 2;
-            constants.viewportOffsetY = (int32_t(g_swapChain->getHeight()) - int32_t(Video::s_viewportHeight)) / 2;
-            constants.viewportWidth = Video::s_viewportWidth;
-            constants.viewportHeight = Video::s_viewportHeight;
+            constants.viewportOffsetX = (int32_t(g_swapChain->getWidth()) - int32_t(viewportWidth)) / 2;
+            constants.viewportOffsetY = (int32_t(g_swapChain->getHeight()) - int32_t(viewportHeight)) / 2;
+            constants.viewportWidth = viewportWidth;
+            constants.viewportHeight = viewportHeight;
 
             auto &framebuffer = g_backBuffer->framebuffers[swapChainTexture];
             if (!framebuffer)
@@ -5830,6 +6636,7 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
     FlushStreamingBuffers(commandList.get());
     PassProfilerEndFrame();
     FrameLogEnd();
+    FinishConditionalCopies();
 #endif
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 1);
     commandList->end();
@@ -5838,7 +6645,7 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
 
     // SwitchPresentOnRenderThread: every command of the frame is recorded; the D3D thread may go on.
     const bool pipelined = cmd.executeCommandList.pipelined;
-    if (pipelined)
+    if (pipelined && !cmd.executeCommandList.captured)
     {
         g_recordedCommandList = true;
         g_recordedCommandList.notify_one();
@@ -6193,6 +7000,12 @@ static void ProcStretchRect(const RenderCommand& cmd)
     const auto surface = isDepthStencil ? g_depthStencil : g_renderTarget;
 #if defined(__SWITCH__)
     FrameLogResolve(surface, args.texture);
+
+    // SwitchDepthRestoreAlias: a resolve of the target reads its values (the copy first); SwitchSubmitTimeCopies: a
+    // surface given a copy decided at submit is read.
+    if (surface == g_depthAlias.target)
+        MaterializeDepthAlias(false);
+    NoteConditionalSurfaceUse(surface);
 #endif
 
     // Erase previous pending command so it doesn't cause the texture to be overriden.
@@ -6203,6 +7016,15 @@ static void ProcStretchRect(const RenderCommand& cmd)
     surface->destinationTextures.emplace(args.texture);
 #if defined(__SWITCH__)
     args.texture->pendingCarried = false;
+
+    // SwitchSubmitTimeCopies: a colour resolve rewrites every texel of the texture before its own image can be read
+    // again (until then its slots sample the surface; the copy or hand-over comes before the surface changes, before
+    // a CPU update of the texture, before a draw that samples it from a multisampled surface, or at the end of the
+    // frame; render targets are destroyed only on the D3D thread, never between a frame's end and the next one's
+    // start, where a pending resolve would be forgotten). A depth resolve still pending at the end of the frame is
+    // dropped instead, so for depth only the copy itself counts.
+    if (surface->format != RenderFormat::D32_FLOAT)
+        NoteConditionalCopyRewrite(args.texture);
 #endif
 
     // If the texture is assigned to any slots, set it again. This'll also push the barrier.
@@ -6350,6 +7172,7 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
 #if defined(__SWITCH__)
                 PassProfilerCopy(surface, texture);
                 texture->pendingCarried = false;
+                NoteConditionalCopyRewrite(texture);
 #endif
                 bool shaderResolve = true;
 
@@ -6439,6 +7262,16 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
                         }
                     }
 
+#if defined(__SWITCH__)
+                    // SwitchSubmitTimeCopies: whether the copy draws anything is decided at submit.
+                    uint32_t conditionalSlot = UINT32_MAX;
+                    if (!multiSampling && CanCopyConditionally(texture))
+                    {
+                        conditionalSlot = BeginConditionalCopy(texture);
+                        pipeline = ConditionalCopyPipeline(texture->format);
+                    }
+#endif
+
                     if (texture->framebuffer == nullptr)
                     {
                         if (texture->format == RenderFormat::D32_FLOAT)
@@ -6468,6 +7301,21 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
                     commandList->setPipeline(pipeline);
                     commandList->setViewports(RenderViewport(0.0f, 0.0f, float(texture->width), float(texture->height), 0.0f, 1.0f));
                     commandList->setScissors(RenderRect(0, 0, texture->width, texture->height));
+#if defined(__SWITCH__)
+                    if (conditionalSlot != UINT32_MAX)
+                    {
+                        const struct
+                        {
+                            uint32_t descriptorIndex;
+                            uint32_t padding;
+                            uint64_t conditionAddress;
+                        } constants = { surface->descriptorIndex, 0, g_conditionalCopyAddresses[g_frame] + conditionalSlot * sizeof(uint32_t) };
+                        commandList->setGraphicsPushConstants(0, &constants, 0, sizeof(constants));
+                        if (!g_copyKeepsVertexConstants)
+                            g_dirtyStates.pixelShaderConstants = true; // (the second 8 bytes too)
+                    }
+                    else
+#endif
                     commandList->setGraphicsPushConstants(0, &surface->descriptorIndex, 0, sizeof(uint32_t));
 #if defined(__SWITCH__)
                     commandList->drawInstanced(g_singleCopyTriangle ? 3 : 6, 1, 0, 0);
@@ -6485,6 +7333,11 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
 
                     if (g_vulkan)
                     {
+#if defined(__SWITCH__)
+                        // SwitchCopyKeepsVertexConstants (from MarathonRecomp-NX): with the uniform-buffer path the block uploaded last
+                        // is still bound and intact, and its pointer is pushed again before a draw that reads pointers.
+                        if (!g_copyKeepsVertexConstants)
+#endif
                         g_dirtyStates.vertexShaderConstants = true; // The push constant call invalidates vertex shader constants.
                         g_dirtyStates.depthBias = true; // Static depth bias in copy pipeline invalidates dynamic depth bias.
                     }
@@ -6674,6 +7527,15 @@ static void ProcExecutePendingStretchRectCommands(const RenderCommand& cmd)
 
 static void SetFramebuffer(GuestSurface* renderTarget, GuestSurface* depthStencil, bool settingForClear)
 {
+#if defined(__SWITCH__)
+    // SwitchReadOnlyDepthSampling: a framebuffer with the depth buffer attached read-only is one of its own (its key
+    // tagged with bit 0: a texture pointer is never odd), selected again when draws switch between the two. (Any other
+    // binding of a framebuffer marks the targets dirty, so this needs only the last draw's choice.)
+    const bool depthReadOnly = g_depthReadOnly && depthStencil != nullptr && !settingForClear;
+    if (!settingForClear && depthReadOnly != g_lastFramebufferDepthReadOnly)
+        g_dirtyStates.renderTargetAndDepthStencil = true;
+#endif
+
     if (settingForClear || g_dirtyStates.renderTargetAndDepthStencil)
     {
         GuestSurface* framebufferContainer = nullptr;
@@ -6697,6 +7559,14 @@ static void SetFramebuffer(GuestSurface* renderTarget, GuestSurface* depthStenci
 
         auto& commandList = g_commandLists[g_frame];
 
+#if defined(__SWITCH__)
+        if (depthReadOnly)
+            framebufferKey = reinterpret_cast<RenderTexture*>(reinterpret_cast<uintptr_t>(framebufferKey) | 1);
+
+        if (!settingForClear)
+            g_lastFramebufferDepthReadOnly = depthReadOnly;
+#endif
+
         if (framebufferContainer != nullptr)
         {
             auto& framebuffer = framebufferContainer->framebuffers[framebufferKey];
@@ -6714,6 +7584,9 @@ static void SetFramebuffer(GuestSurface* renderTarget, GuestSurface* depthStenci
                 if (depthStencil != nullptr)
                     desc.depthAttachment = depthStencil->texture;
 
+#if defined(__SWITCH__)
+                desc.depthAttachmentReadOnly = depthReadOnly;
+#endif
                 framebuffer = g_device->createFramebuffer(desc);
             }
 
@@ -6768,7 +7641,9 @@ static void Clear(GuestDevice* device, uint32_t flags, uint32_t, be<float>* colo
 // descriptors and framebuffers stay alive until the frame's commands, which may use them, are done.
 static bool CanHandOver(const GuestSurface* surface, const GuestTexture* texture)
 {
+    // (SwitchDepthRestoreAlias: neither image of an alias changes hands while it holds.)
     return CanKeepResolvePending(surface) && texture->handOverCapable && texture->textureHolder != nullptr &&
+        surface != g_depthAlias.target && surface != g_depthAlias.source &&
         texture->patchedTexture == nullptr && texture->recreatedCubeMapTexture == nullptr && texture->width == surface->width &&
         texture->height == surface->height && texture->format == surface->format;
 }
@@ -6777,6 +7652,11 @@ static bool CanHandOver(const GuestSurface* surface, const GuestTexture* texture
 // holds, valid until the frame's commands are done.
 static uint32_t HandOverSurfaceImage(GuestSurface* surface, GuestTexture* texture)
 {
+    // SwitchSubmitTimeCopies: the texture's image is replaced (its old one goes to the surface, overwritten there); the
+    // surface's image is read (it becomes the texture's).
+    NoteConditionalCopyRewrite(texture);
+    NoteConditionalSurfaceUse(surface);
+
     // Barriers still pending are keyed by image and stay right across the swap (each object's layout
     // moves with its image), so they go out with the caller's batch instead of one of their own.
     const uint32_t oldSurfaceDescriptor = surface->descriptorIndex;
@@ -7395,6 +8275,11 @@ static void FinishEdgePixels(const GuestSurface* surface)
 
         if (g_vulkan)
         {
+#if defined(__SWITCH__)
+            // SwitchCopyKeepsVertexConstants (from MarathonRecomp-NX): with the uniform-buffer path the block uploaded last
+            // is still bound and intact, and its pointer is pushed again before a draw that reads pointers.
+            if (!g_copyKeepsVertexConstants)
+#endif
             g_dirtyStates.vertexShaderConstants = true; // The push constant call invalidates vertex shader constants.
             g_dirtyStates.depthBias = true;
         }
@@ -7579,6 +8464,219 @@ static bool DrawReplacesDepth(GuestSurface* surface, EdgePixels& edges)
     }
 
     return GetFullScreenCoverage(surface, edges);
+}
+
+// [Switch] Round 15, SwitchDepthRestoreAlias. After its post-processing the game fills a second depth buffer with the
+// main one's values (a full-screen draw of a depth-copy shader that reads the main depth's pending resolve: depth
+// test ALWAYS with writes) and draws a late pass against it that only tests depth. The restore is not drawn: the
+// second buffer (the target) stands for the first (the source) until the two would differ, and draws that only test
+// the target are tested against the source itself, attached read-only (DEPTH_READ, where its pending resolves can
+// still be sampled). Exact: the restore would have written every pixel of the target (a proven full-screen quad
+// without uncertain edge pixels, no discard, no alpha test or coverage, ALWAYS) with the value of the source's texel
+// at that pixel (point sampling, each pixel's own texel), saturated and clamped to the [0, 1] depth range, which
+// leaves a depth value unchanged; so a test against the source gives what a test against the target would have.
+// Before anything could tell the two apart, the target gets that copy for real (MaterializeDepthAlias): a draw that
+// writes the target's depth, a resolve of the target, the source about to change (a draw writing its depth, a depth
+// clear of it, its destruction); a depth clear of the target ends the alias with nothing to copy. Hand-overs of either
+// image are not made while the alias holds. The copy made because the source changes is decided at submit
+// (SwitchSubmitTimeCopies' mechanism): it draws nothing when the target's next use in the frame is a depth clear.
+static bool TryDepthRestoreAlias(const uint8_t* vertices, uint32_t vertexCount, uint32_t stride)
+{
+    const GuestShader* vertexShader = g_pipelineState.vertexShader;
+    const GuestShader* pixelShader = g_pipelineState.pixelShader;
+    if (pixelShader == nullptr || pixelShader->shaderCacheEntry == nullptr ||
+        (pixelShader->shaderCacheEntry->flags & SHADER_FLAG_DEPTH_COPY) == 0 || vertices == nullptr)
+    {
+        return false;
+    }
+
+    constexpr uint32_t PASS_THROUGH = SHADER_FLAG_POSITION_PASS_THROUGH | SHADER_FLAG_TEXCOORD_PASS_THROUGH;
+    if (vertexShader == nullptr || vertexShader->shaderCacheEntry == nullptr ||
+        (vertexShader->shaderCacheEntry->flags & PASS_THROUGH) != PASS_THROUGH)
+    {
+        return false;
+    }
+
+    const auto& state = g_pipelineState;
+    GuestSurface* const renderTarget = state.colorWriteEnable != 0 ? g_renderTarget : nullptr;
+    GuestSurface* const target = state.zEnable ? g_depthStencil : nullptr;
+    if (target == nullptr || renderTarget != nullptr || !state.zWriteEnable || target->format != RenderFormat::D32_FLOAT ||
+        target->sampleCount != RenderSampleCount::COUNT_1 || !target->destinationTextures.empty() ||
+        std::min(g_viewport.minDepth, g_viewport.maxDepth) != 0.0f || std::max(g_viewport.minDepth, g_viewport.maxDepth) != 1.0f)
+    {
+        return false;
+    }
+
+    const uint32_t pixelFlags = pixelShader->shaderCacheEntry->flags;
+    const uint32_t slot = (pixelFlags >> SHADER_FLAG_COPY_SLOT_SHIFT) & SHADER_FLAG_COPY_SLOT_MASK;
+    const GuestTexture* texture = slot < std::size(g_textures) ? g_textures[slot] : nullptr;
+    GuestSurface* const source = texture != nullptr ? texture->sourceSurface : nullptr;
+    if (source == nullptr || source == target || source->format != RenderFormat::D32_FLOAT ||
+        source->sampleCount != RenderSampleCount::COUNT_1 || source->width != target->width || source->height != target->height ||
+        g_sharedConstants.texture2DIndices[slot] != source->descriptorIndex ||
+        (g_deferredDepthClear.pending && g_deferredDepthClear.surface == source))
+    {
+        return false;
+    }
+
+    const RenderSamplerDesc& sampler = g_samplerDescs[slot];
+    if (sampler.minFilter != RenderFilter::NEAREST || sampler.magFilter != RenderFilter::NEAREST || sampler.anisotropyEnabled)
+        return false;
+
+    // Each pixel reads its own texel (as IsIdentityRestore: POSITION and TEXCOORD0 passed through, 32-bit floats in
+    // stream 0; at every vertex the texture coordinates are the framebuffer position over the size, within 1/64 texel).
+    const GuestVertexDeclaration* declaration = state.vertexDeclaration;
+    const RenderInputElement* position = nullptr;
+    const RenderInputElement* texcoord = nullptr;
+    for (uint32_t i = 0; i < declaration->inputElementCount; i++)
+    {
+        const RenderInputElement& element = declaration->inputElements[i];
+        if (element.location == 0)
+            position = &element;
+        else if (element.location == 4)
+            texcoord = &element;
+    }
+
+    auto floatComponents = [](const RenderInputElement* element)
+        {
+            if (element == nullptr || element->slotIndex != 0)
+                return 0u;
+
+            switch (element->format)
+            {
+            case RenderFormat::R32G32_FLOAT:
+                return 2u;
+            case RenderFormat::R32G32B32_FLOAT:
+                return 3u;
+            case RenderFormat::R32G32B32A32_FLOAT:
+                return 4u;
+            default:
+                return 0u;
+            }
+        };
+
+    const uint32_t positionComponents = floatComponents(position);
+    const uint32_t texcoordComponents = floatComponents(texcoord);
+    if (positionComponents == 0 || texcoordComponents == 0 || position->alignedByteOffset + positionComponents * 4 > stride ||
+        texcoord->alignedByteOffset + 8 > stride || vertexCount == 0 || vertexCount > 64 ||
+        (declaration->swappedTexcoords & 1) != 0)
+    {
+        return false;
+    }
+
+    const double offsetX = 1.0f / float(target->width);
+    const double offsetY = -1.0f / float(target->height);
+    const double width = double(target->width);
+    const double height = double(target->height);
+    constexpr double TOLERANCE = 1.0 / 64.0; // texels
+
+    for (uint32_t i = 0; i < vertexCount; i++)
+    {
+        const uint8_t* vertex = vertices + size_t(i) * stride;
+        auto load = [](const uint8_t* data)
+            {
+                uint32_t value;
+                memcpy(&value, data, sizeof(value));
+                return double(std::bit_cast<float>(ByteSwap(value)));
+            };
+
+        const double x = load(vertex + position->alignedByteOffset);
+        const double y = load(vertex + position->alignedByteOffset + 4);
+        const double z = positionComponents >= 3 ? load(vertex + position->alignedByteOffset + 8) : 0.0;
+        const double u = load(vertex + texcoord->alignedByteOffset);
+        const double v = load(vertex + texcoord->alignedByteOffset + 4);
+
+        const double fx = double(g_viewport.x) + (x + offsetX + 1.0) * double(g_viewport.width) * 0.5;
+        const double fy = double(g_viewport.y) + (1.0 - (y + offsetY)) * double(g_viewport.height) * 0.5;
+
+        if (!std::isfinite(fx) || !std::isfinite(fy) || !std::isfinite(u) || !std::isfinite(v) || !(z >= 0.0 && z <= 1.0) ||
+            std::abs(u * width - fx) > TOLERANCE || std::abs(v * height - fy) > TOLERANCE)
+        {
+            return false;
+        }
+    }
+
+    // Every pixel of the target written whatever its old value, none left uncertain at the edges.
+    EdgePixels edges;
+    if (!DrawReplacesDepth(target, edges) || edges.count != 0)
+        return false;
+
+    // Another alias goes first (its copy decided at submit).
+    if (g_depthAlias.target != nullptr && g_depthAlias.target != target)
+        MaterializeDepthAlias(true);
+
+    g_depthAlias.target = target;
+    g_depthAlias.source = source;
+
+    // The restore rewrites every pixel of the target: a copy into it decided at submit earlier in the frame is never
+    // seen (while the alias holds, the target's own image is not used).
+    NoteConditionalSurfaceRewrite(target);
+
+    // The target's waiting clear (SwitchSkipOverwrittenDepthClears), which the restore would have overwritten.
+    if (g_deferredDepthClear.pending && g_deferredDepthClear.surface == target)
+        g_deferredDepthClear.pending = false;
+
+    g_profilerDepthAliasRestores++;
+    return true;
+}
+
+// The copy the restore draw would have made, of the source's depth into the target, now (before the source changes,
+// or before the target is written or read in a way the alias does not cover); `conditional`: decided at submit.
+static void MaterializeDepthAlias(bool conditional)
+{
+    GuestSurface* const target = g_depthAlias.target;
+    GuestSurface* const source = g_depthAlias.source;
+    g_depthAlias = {};
+    if (target == nullptr || !g_commandListOpen)
+        return;
+
+    auto& commandList = g_commandLists[g_frame];
+    AddBarrier(source, RenderTextureLayout::SHADER_READ);
+    AddBarrier(target, RenderTextureLayout::DEPTH_WRITE);
+    FlushBarriers();
+    SetFramebuffer(nullptr, target, true);
+
+    uint32_t slot = UINT32_MAX;
+    RenderPipeline* pipeline = g_copyDepthPipeline.get();
+    if (conditional && g_conditionalCopyDepthPipeline != nullptr && g_conditionalCopies.size() < CONDITIONAL_COPY_SLOTS)
+    {
+        slot = BeginConditionalSurfaceCopy(target);
+        pipeline = g_conditionalCopyDepthPipeline.get();
+    }
+
+    commandList->setPipeline(pipeline);
+    commandList->setViewports(RenderViewport(0.0f, 0.0f, float(target->width), float(target->height), 0.0f, 1.0f));
+    commandList->setScissors(RenderRect(0, 0, target->width, target->height));
+    if (slot != UINT32_MAX)
+    {
+        const struct
+        {
+            uint32_t descriptorIndex;
+            uint32_t padding;
+            uint64_t conditionAddress;
+        } constants = { source->descriptorIndex, 0, g_conditionalCopyAddresses[g_frame] + slot * sizeof(uint32_t) };
+        commandList->setGraphicsPushConstants(0, &constants, 0, sizeof(constants));
+        if (!g_copyKeepsVertexConstants)
+            g_dirtyStates.pixelShaderConstants = true;
+    }
+    else
+    {
+        commandList->setGraphicsPushConstants(0, &source->descriptorIndex, 0, sizeof(uint32_t));
+    }
+    commandList->drawInstanced(g_singleCopyTriangle ? 3 : 6, 1, 0, 0);
+#ifdef UNLEASHED_RECOMP_CONSTANTS_UBO
+    InvalidatePushedRootAddresses();
+#endif
+
+    g_dirtyStates.renderTargetAndDepthStencil = true;
+    g_dirtyStates.viewport = true;
+    g_dirtyStates.pipelineState = true;
+    g_dirtyStates.scissorRect = true;
+    if (!g_copyKeepsVertexConstants)
+        g_dirtyStates.vertexShaderConstants = true;
+    g_dirtyStates.depthBias = true;
+
+    g_profilerDepthAliasCopies++;
 }
 
 // At the start of FlushRenderStateForRenderThread.
@@ -7952,6 +9050,11 @@ static void FinishCoverageFixup()
 
     if (g_vulkan)
     {
+#if defined(__SWITCH__)
+        // SwitchCopyKeepsVertexConstants (from MarathonRecomp-NX): with the uniform-buffer path the block uploaded last
+        // is still bound and intact, and its pointer is pushed again before a draw that reads pointers.
+        if (!g_copyKeepsVertexConstants)
+#endif
         g_dirtyStates.vertexShaderConstants = true; // The push constant call invalidates vertex shader constants.
         g_dirtyStates.depthBias = true;
     }
@@ -7963,6 +9066,19 @@ static void ProcClear(const RenderCommand& cmd)
     const auto& args = cmd.clear;
 #if defined(__SWITCH__)
     FrameLogClear(args.flags, args.color, args.z);
+
+    // SwitchDepthRestoreAlias: a depth clear (of the whole buffer) of the target ends the alias with nothing to copy;
+    // one of the source changes it, so the target gets its copy first. A depth buffer given a copy decided at submit
+    // (SwitchSubmitTimeCopies) is rewritten entirely by it.
+    if ((args.flags & D3DCLEAR_ZBUFFER) != 0 && g_depthStencil != nullptr)
+    {
+        if (g_depthAlias.target == g_depthStencil)
+            g_depthAlias = {};
+        else if (g_depthAlias.source == g_depthStencil)
+            MaterializeDepthAlias(true);
+
+        NoteConditionalSurfaceRewrite(g_depthStencil);
+    }
 
     // Round 9 (SwitchCarryClears, SwitchSkipOverwrittenDepthClears): a waiting clear of a surface this clear
     // clears again is overwritten entirely by it and dropped; one of another surface goes out first, as only one
@@ -9082,7 +10198,16 @@ static RenderPipeline* FindOrCreateGraphicsPipeline(PipelineState pipelineState)
     auto& pipeline = g_pipelines[hash];
     if (pipeline == nullptr)
     {
+#if defined(__SWITCH__)
+        const auto createStart = std::chrono::steady_clock::now();
         pipeline = CreateGraphicsPipeline(pipelineState);
+        const double createMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - createStart).count();
+        g_profilerRenderThreadPipelines++;
+        g_profilerRenderThreadPipelineMs += createMs;
+        g_profilerRenderThreadPipelineLongestMs = std::max(g_profilerRenderThreadPipelineLongestMs, createMs);
+#else
+        pipeline = CreateGraphicsPipeline(pipelineState);
+#endif
 #if defined(__SWITCH__)
         g_pipelineGeneration++;
 #endif
@@ -9285,13 +10410,13 @@ static void EnqueueShaderConstants(LocalRenderCommandQueue& queue, RenderCommand
             cmd.type = type;
             if (type == RenderCommandType::SetVertexShaderConstants)
             {
-                cmd.setVertexShaderConstants.memory = g_intermediaryUploadAllocator.allocate(&constants[index], size);
+                cmd.setVertexShaderConstants.memory = CurrentIntermediaryUploadAllocator().allocate(&constants[index], size);
                 cmd.setVertexShaderConstants.index = index;
                 cmd.setVertexShaderConstants.size = size;
             }
             else
             {
-                cmd.setPixelShaderConstants.memory = g_intermediaryUploadAllocator.allocate(&constants[index], size);
+                cmd.setPixelShaderConstants.memory = CurrentIntermediaryUploadAllocator().allocate(&constants[index], size);
                 cmd.setPixelShaderConstants.index = index;
                 cmd.setPixelShaderConstants.size = size;
             }
@@ -9439,7 +10564,7 @@ static void FlushRenderStateForMainThread(GuestDevice* device, LocalRenderComman
 
         auto& cmd = queue.enqueue();
         cmd.type = RenderCommandType::SetVertexShaderConstants;
-        cmd.setVertexShaderConstants.memory = g_intermediaryUploadAllocator.allocate(&device->vertexShaderFloatConstants[index], size);
+        cmd.setVertexShaderConstants.memory = CurrentIntermediaryUploadAllocator().allocate(&device->vertexShaderFloatConstants[index], size);
         cmd.setVertexShaderConstants.index = index;
         cmd.setVertexShaderConstants.size = size;
 
@@ -9457,7 +10582,7 @@ static void FlushRenderStateForMainThread(GuestDevice* device, LocalRenderComman
 
         auto& cmd = queue.enqueue();
         cmd.type = RenderCommandType::SetPixelShaderConstants;
-        cmd.setPixelShaderConstants.memory = g_intermediaryUploadAllocator.allocate(&device->pixelShaderFloatConstants[index], size);
+        cmd.setPixelShaderConstants.memory = CurrentIntermediaryUploadAllocator().allocate(&device->pixelShaderFloatConstants[index], size);
         cmd.setPixelShaderConstants.index = index;
         cmd.setPixelShaderConstants.size = size;
 
@@ -9673,7 +10798,9 @@ static bool CanLeaveDepthResolvesPending(const GuestSurface* surface)
 {
     // Round 9: a depth buffer SwitchEagerDepthTransitions made ready for sampling goes back to being an
     // attachment (the draw's barrier); while no slot holds one of its textures that changes nothing they read.
-    const bool attachment = surface->layout == RenderTextureLayout::DEPTH_WRITE ||
+    // (Round 15: DEPTH_READ too, the layout a read-only draw leaves it in: SwitchReadOnlyDepthSampling,
+    // SwitchSampledSlotResolves, SwitchDepthRestoreAlias.)
+    const bool attachment = surface->layout == RenderTextureLayout::DEPTH_WRITE || surface->layout == RenderTextureLayout::DEPTH_READ ||
         (g_eagerDepthTransitions && surface->layout == RenderTextureLayout::SHADER_READ);
     if (surface->sampleCount != RenderSampleCount::COUNT_1 || !attachment)
         return false;
@@ -9684,6 +10811,65 @@ static bool CanLeaveDepthResolvesPending(const GuestSurface* surface)
         {
             if (g_textures[i] == texture)
                 return false;
+        }
+    }
+
+    return true;
+}
+
+// [Switch] Round 15, SwitchSampledSlotResolves. A draw that only tests its depth buffer while slots hold some of that
+// buffer's pending textures, none of them a slot the draw's shaders can sample (the translator's sampler masks; every
+// slot for the port's own shaders): the copy waits, and the buffer is attached read-only (DEPTH_READ), a layout in which
+// those slots' later draws can still sample it (CanLeaveDepthResolvesPending leaves it waiting only when no slot holds
+// one, since it keeps the buffer writable). The draw reads nothing through those slots and leaves the buffer as it is,
+// so the copy, made later, holds the same texels.
+static bool PendingTexturesBoundButUnsampled(const GuestSurface* surface)
+{
+    if (surface->sampleCount != RenderSampleCount::COUNT_1 || surface->format != RenderFormat::D32_FLOAT)
+        return false;
+
+    const uint32_t slotsRead = TextureSlotsRead(g_pipelineState.vertexShader) | TextureSlotsRead(g_pipelineState.pixelShader);
+    bool bound = false;
+    for (const auto texture : surface->destinationTextures)
+    {
+        for (uint32_t i = 0; i < std::size(g_textures); i++)
+        {
+            if (g_textures[i] == texture)
+            {
+                if ((slotsRead & (1u << i)) != 0)
+                    return false;
+
+                bound = true;
+            }
+        }
+    }
+
+    return bound;
+}
+
+// [Switch] Round 15, SwitchReadOnlyDepthSampling (from MarathonRecomp-NX). A draw that tests its depth buffer without
+// writing it (this port's depth buffers are D32, without stencil) while a slot samples one of that buffer's pending
+// resolves: the buffer is attached read-only (DEPTH_READ, where sampling is allowed too) and the slot keeps sampling
+// the buffer itself, as it does while the resolve waits, instead of the copy being made first. The texels sampled are
+// the buffer's, which the copy would have held: nothing changes the buffer before its copy is made (a draw writing
+// depth, a clear or a resolve of it makes the copy first). The depth test reads the same values. Only for textures
+// whose own view would give what the buffer's plain view gives: one level, the same format and size, an identity
+// component mapping, single sample.
+static bool CanSampleDepthReadOnly(const GuestSurface* surface)
+{
+    if (surface->sampleCount != RenderSampleCount::COUNT_1 || surface->format != RenderFormat::D32_FLOAT)
+        return false;
+
+    for (const auto texture : surface->destinationTextures)
+    {
+        const RenderComponentMapping& mapping = texture->viewDesc.componentMapping;
+        if (!texture->handOverCapable || texture->format != surface->format || texture->width != surface->width ||
+            texture->height != surface->height || texture->patchedTexture != nullptr ||
+            texture->recreatedCubeMapTexture != nullptr || mapping.r != RenderSwizzle::IDENTITY ||
+            mapping.g != RenderSwizzle::IDENTITY || mapping.b != RenderSwizzle::IDENTITY ||
+            mapping.a != RenderSwizzle::IDENTITY)
+        {
+            return false;
         }
     }
 
@@ -9723,6 +10909,32 @@ static void FlushRenderStateForRenderThread()
     auto depthStencil = g_pipelineState.zEnable ? g_depthStencil : nullptr;
 
 #if defined(__SWITCH__)
+    // SwitchDepthRestoreAlias: a draw that writes the source's depth changes it, one that writes the target's needs
+    // the target's own values: the copy first. One that only tests the target is tested against the source.
+    bool aliasedDepth = false;
+    if (g_depthAlias.target != nullptr && depthStencil != nullptr)
+    {
+        if (depthStencil == g_depthAlias.source && g_pipelineState.zWriteEnable)
+        {
+            MaterializeDepthAlias(true);
+        }
+        else if (depthStencil == g_depthAlias.target)
+        {
+            if (g_pipelineState.zWriteEnable)
+            {
+                MaterializeDepthAlias(false);
+            }
+            else
+            {
+                depthStencil = g_depthAlias.source;
+                aliasedDepth = true;
+            }
+        }
+    }
+
+    // SwitchSubmitTimeCopies: a depth buffer given a copy decided at submit is used by this draw.
+    NoteConditionalSurfaceUse(depthStencil);
+
     if (g_deferredClear.pending)
         ResolveDeferredClear(renderTarget, depthStencil);
 
@@ -9760,10 +10972,36 @@ static void FlushRenderStateForRenderThread()
         TryCoverageHandOver(renderTarget, depthStencil);
 
     auto depthToResolve = depthStencil;
-    if (g_lazyResolves && depthToResolve != nullptr && !depthToResolve->destinationTextures.empty() &&
+    g_depthReadOnly = false;
+    if (aliasedDepth)
+    {
+        // SwitchDepthRestoreAlias: the source, read-only (its pending resolves stay; sampling them is allowed).
+        depthToResolve = nullptr;
+        g_depthReadOnly = true;
+        g_profilerDepthAliasDraws++;
+    }
+    else if (g_lazyResolves && depthToResolve != nullptr && !depthToResolve->destinationTextures.empty() &&
         !g_pipelineState.zWriteEnable && CanLeaveDepthResolvesPending(depthToResolve))
     {
         depthToResolve = nullptr;
+    }
+    else if (g_sampledSlotResolves && g_lazyResolves && depthToResolve != nullptr && !depthToResolve->destinationTextures.empty() &&
+        !g_pipelineState.zWriteEnable && !depthClearNow && depthClearEdges.count == 0 && !g_coverageFixup.pending &&
+        PendingTexturesBoundButUnsampled(depthToResolve))
+    {
+        // SwitchSampledSlotResolves: read-only, its resolves left pending.
+        depthToResolve = nullptr;
+        g_depthReadOnly = true;
+        g_profilerSampledSlotDraws++;
+    }
+    else if (g_readOnlyDepthSampling && depthToResolve != nullptr && !depthToResolve->destinationTextures.empty() &&
+        !g_pipelineState.zWriteEnable && !depthClearNow && depthClearEdges.count == 0 && !g_coverageFixup.pending &&
+        CanSampleDepthReadOnly(depthToResolve))
+    {
+        // SwitchReadOnlyDepthSampling: the buffer attached read-only, its resolves left pending.
+        depthToResolve = nullptr;
+        g_depthReadOnly = true;
+        g_profilerReadOnlyDepthDraws++;
     }
 
     DropDeadPendingResolves(depthToResolve);
@@ -9830,7 +11068,11 @@ static void FlushRenderStateForRenderThread()
 #endif
 
     AddBarrier(renderTarget, RenderTextureLayout::COLOR_WRITE);
+#if defined(__SWITCH__)
+    AddBarrier(depthStencil, g_depthReadOnly ? RenderTextureLayout::DEPTH_READ : RenderTextureLayout::DEPTH_WRITE);
+#else
     AddBarrier(depthStencil, RenderTextureLayout::DEPTH_WRITE);
+#endif
 
 #if defined(__SWITCH__)
     if (!g_barrierMap.empty() && !g_dirtyStates.renderTargetAndDepthStencil && !g_coverageFixup.pending)
@@ -9845,6 +11087,7 @@ static void FlushRenderStateForRenderThread()
 #endif
     SetFramebuffer(renderTarget, depthStencil, false);
 #if defined(__SWITCH__)
+    g_depthReadOnly = false;
     FinishEdgePixels(renderTarget);
 
     // The waiting depth clear, in this pass (a coverage hand-over, whose framebuffer has no depth buffer of the
@@ -9999,6 +11242,10 @@ static void FlushRenderStateForRenderThread()
 #if defined(__SWITCH__)
     if (skippedPixelConstants && !uploadPixelShaderConstants)
         g_dirtyStates.pixelShaderConstants = true;
+
+    // SwitchSubmitTimeCopies: what this draw can sample.
+    if (!g_conditionalCopies.empty())
+        NoteConditionalCopyReads();
 #endif
 }
 
@@ -10186,7 +11433,7 @@ static void DrawPrimitiveUP(GuestDevice* device, uint32_t primitiveType, uint32_
     cmd.type = RenderCommandType::DrawPrimitiveUP;
     cmd.drawPrimitiveUP.primitiveType = primitiveType;
     cmd.drawPrimitiveUP.primitiveCount = primitiveCount;
-    cmd.drawPrimitiveUP.vertexStreamZeroData = g_intermediaryUploadAllocator.allocate(vertexStreamZeroData, primitiveCount * vertexStreamZeroStride);
+    cmd.drawPrimitiveUP.vertexStreamZeroData = CurrentIntermediaryUploadAllocator().allocate(vertexStreamZeroData, primitiveCount * vertexStreamZeroStride);
     cmd.drawPrimitiveUP.vertexStreamZeroSize = primitiveCount * vertexStreamZeroStride;
     cmd.drawPrimitiveUP.vertexStreamZeroStride = vertexStreamZeroStride;
     cmd.drawPrimitiveUP.csdFilterState = g_csdFilterState;
@@ -10244,12 +11491,21 @@ static void ProcDrawPrimitiveUP(const RenderCommand& cmd)
         FrameLogDraw("up", args.primitiveCount, "restore");
         return;
     }
-    FrameLogDraw("up", args.primitiveCount, nullptr);
 
     g_currentDrawVertices.data = args.vertexStreamZeroData;
     g_currentDrawVertices.count = args.primitiveCount;
     g_currentDrawVertices.stride = args.vertexStreamZeroStride;
     g_currentDrawVertices.primitiveType = args.primitiveType;
+
+    // SwitchDepthRestoreAlias: a depth restore from another depth buffer is not drawn (TryDepthRestoreAlias).
+    if (g_depthRestoreAlias && TryDepthRestoreAlias(reinterpret_cast<const uint8_t*>(args.vertexStreamZeroData), args.primitiveCount,
+        args.vertexStreamZeroStride))
+    {
+        g_currentDrawVertices.data = nullptr;
+        FrameLogDraw("up", args.primitiveCount, "depth restore aliased");
+        return;
+    }
+    FrameLogDraw("up", args.primitiveCount, nullptr);
 #endif
 
     FlushRenderStateForRenderThread();
@@ -11525,6 +12781,11 @@ void SetShadowResolutionMidAsmHook(PPCRegister& r11)
 
 static void SetResolution(be<uint32_t>* device)
 {
+#if defined(__SWITCH__)
+    // SwitchPresentWithoutRecordWait: the render thread may still be recording the previous frame.
+    if (g_presentWithoutRecordWait)
+        WaitForPresentTail(false);
+#endif
     Video::ComputeViewportDimensions();
 
     uint32_t width = uint32_t(round(Video::s_viewportWidth * Config::ResolutionScale));
@@ -11997,6 +13258,12 @@ static void CompilePipeline(XXH64_hash_t pipelineHash, const PipelineState& pipe
     EnqueueRenderCommand(cmd);
 }
 
+#if defined(__SWITCH__)
+// SwitchPipelineCacheSaveAfterCompiles: see PipelineCompilerThread.
+static std::atomic<uint32_t> g_pipelineCompilesInFlight{ 0 };
+static std::atomic<bool> g_pipelinesCompiledSinceSave{ false };
+#endif
+
 static void PipelineCompilerThread()
 {
 #ifdef _WIN32
@@ -12048,11 +13315,26 @@ static void PipelineCompilerThread()
         }
 #endif
 
+#if defined(__SWITCH__)
+        g_pipelineCompilesInFlight.fetch_add(1, std::memory_order_acq_rel);
+#endif
         CompilePipeline(queueItem.pipelineHash, queueItem.pipelineState
 #ifdef ASYNC_PSO_DEBUG
             , queueItem.pipelineName.c_str()
 #endif
         );
+#if defined(__SWITCH__)
+        // SwitchPipelineCacheSaveAfterCompiles: the pipelines compiled after a stage load (a loading screen's end
+        // saves the cache before they are made) are saved once the queue drains, instead of at the next loading
+        // screen, which may never come in this session. The save skips everything when they all hit the cache.
+        g_pipelinesCompiledSinceSave.store(true, std::memory_order_release);
+        if (g_pipelineCompilesInFlight.fetch_sub(1, std::memory_order_acq_rel) == 1 && Config::SwitchPipelineCacheSaveAfterCompiles &&
+            g_pipelineStateQueue.size_approx() == 0 && !*SWA::SGlobals::ms_IsLoading &&
+            g_pipelinesCompiledSinceSave.exchange(false, std::memory_order_acq_rel))
+        {
+            RequestPipelineCacheSave();
+        }
+#endif
 
         std::this_thread::yield();
     }
@@ -13350,6 +14632,12 @@ SDLEventListenerForPSOCaching g_sdlEventListenerForPSOCaching;
 
 void VideoConfigValueChangedCallback(IConfigDef* config)
 {
+#if defined(__SWITCH__)
+    // SwitchPresentWithoutRecordWait: the render thread may still be recording the previous frame, which reads the
+    // viewport and these settings.
+    if (g_presentWithoutRecordWait)
+        WaitForPresentTail(false);
+#endif
     // Config options that require internal resolution resize
     g_needsResize |=
         config == &Config::AspectRatio ||

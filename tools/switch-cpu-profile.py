@@ -108,6 +108,7 @@ def symbolize_return(starts, names, offset):
 def parse(log, which):
     reports = []
     watchdog = []   # "[stall]" and "[hitch]" lines, in order
+    slow = []       # round 12: the "slow frames:" line of each report (SwitchSlowFrameProfileMs)
     current = None
     thread = None
     # Several threads can have the same name (guest threads started at the same address): each one's
@@ -127,6 +128,10 @@ def parse(log, which):
                 thread = None
                 continue
             if current is None:
+                continue
+            if line.startswith('  slow frames:'):
+                slow.append(line.strip())
+                thread = None
                 continue
             m = THREAD_RE.match(line)
             if m:
@@ -157,7 +162,8 @@ def parse(log, which):
         sys.exit(f'no [cpu profile], [stall], [hitch] or [crash] lines in {log} (was SwitchCpuProfiler = true?)')
     if which is not None and reports:
         reports = [reports[which - 1 if which > 0 else which]]
-    return reports, watchdog
+        slow = [slow[which - 1 if which > 0 else which]] if len(slow) >= abs(which) else []
+    return reports, watchdog, slow
 
 
 def describe_callers(starts, names, callers):
@@ -184,7 +190,7 @@ def main():
     args = parser.parse_args()
 
     starts, names = load_symbols(args.elf)
-    reports, watchdog = parse(args.log, args.report)
+    reports, watchdog, slow = parse(args.log, args.report)
 
     seconds = sum(r['seconds'] for r in reports)
     per_thread = collections.OrderedDict()   # thread -> function -> samples
@@ -220,13 +226,25 @@ def main():
                 print(f'  {100.0 * samples / total:5.1f}%  {samples:8.0f}  {function}')
             waits = per_thread_waits.get(name)
             if waits and syscalls[name] > 0:
-                print(f'  in system calls in {syscalls[name]} samples, from:')
+                if name.endswith(' in slow frames'):
+                    # Every sample of the game thread in a slow frame: where it was, then its callers.
+                    print(f'  where its {syscalls[name]} samples were (the code, then its callers):')
+                else:
+                    print(f'  in system calls in {syscalls[name]} samples, from:')
                 for chain, samples in waits.most_common(args.waits):
                     print(f'    {100.0 * samples / syscalls[name]:5.1f}%  {chain}')
-            everything.update(functions)
+            if not name.endswith(' in slow frames'):
+                everything.update(functions)
             print()
 
-        grand = sum(running.values())
+        if slow:
+            print('slow frames (round 12, SwitchSlowFrameProfileMs), per report:')
+            for line in slow:
+                print(f'  {line}')
+            print()
+
+        grand = sum(running.values() if not any(n.endswith(' in slow frames') for n in running) else
+                    [v for n, v in running.items() if not n.endswith(' in slow frames')])
         print(f'all threads ({grand} samples running):')
         for function, samples in everything.most_common(args.top):
             print(f'  {100.0 * samples / max(1, grand):5.1f}%  {samples:8.0f}  {function}')

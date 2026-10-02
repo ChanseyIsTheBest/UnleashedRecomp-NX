@@ -23,7 +23,8 @@ std::filesystem::path BuildUserPath()
 
     CoTaskMemFree(knownPath);
 #elif defined(__SWITCH__)
-    userPath = "sdmc:/switch/UnleashedRecomp";
+    // [Switch] Next to the NRO, wherever it is on the SD card (os/switch/process_switch.cpp).
+    userPath = g_executableRoot;
 #elif defined(__linux__) || defined(__APPLE__)
     const char* homeDir = getenv("HOME");
 #if defined(__linux__)

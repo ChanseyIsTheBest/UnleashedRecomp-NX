@@ -15,6 +15,13 @@ configuration, run at the same places. Contents:
   [Round 10](#round-10-dead-copies-more-sinking-pipelined-present-pgo-test-set-unleashed-test-round9)); the first
   rounds are described under [Notes on each change](#notes-on-each-change)
 - [Final build](#final-build): the defaults it ships with, the docked and handheld sizes, logging and crash reports
+- After the final build: [Round 11](#round-11-cpu-native-dispatch-mixer-kernels-code-generation-test-set-unleashed-test-round11),
+  [Round 12](#round-12-frame-dips-test-set-unleashed-test-round12),
+  [Round 13](#round-13-light-field-prefetches-gpu-slow-frames-test-set-unleashed-test-round13),
+  [Round 14](#round-14-fpcr-mode-switches-memcpy-kernel-waits-test-set-unleashed-test-round14),
+  [Round 15](#round-15-the-sound-servers-work-explicit-multiply-adds-main-thread-clusters-dead-copies-test-set-unleashed-test-round15),
+  [Round 16](#round-16-the-dark-eyes-test-set-unleashed-test-round16-fix)
+- [Current state](#current-state): the defaults now
 - [Considered and not done](#considered-and-not-done), [Further opportunities](#further-opportunities-not-implemented),
   [How to measure](#how-to-measure)
 
@@ -36,6 +43,15 @@ limits the frame.
 | `unleashed-test-round7` | round 8 | 42 FPS | 480p: 59.3 FPS (60 FPS cap); 56.3 without the round 8 CPU changes | the 480p runs froze: the CPU sampler held a lock during SD writes (fixed in round 9) |
 | `unleashed-test-round8` | round 9 | 41 FPS; 42 with the quad sinking off | 1020 MHz: 51 FPS; 53.3 with the guest-kernel sync changes | game thread 17.64 ms of work per frame, 1.06 ms in Present |
 | `unleashed-test-round9` | round 10 | 44.0 FPS; 42.4 without the four round 10 renderer changes | 1020 MHz: 53.6 FPS; 52 with the present on the main thread | PGO + LTO + `-O2` + `-fipa-pta` build. Long play with the four renderer changes on lost the GPU twice, so they are off in the [final build](#final-build) |
+| `unleashed-test-round11` | round 11 | — | 858x482: 57.7 FPS all on; 52 FPS with the round 11 switches off | verifying every call was too slow to reach a stage (sampled from round 12 on) |
+| `unleashed-test-round12` | round 12 | — | hub 59 FPS; 58.0 with the round 12 switches off; 5+ FPS more in explosions and large impacts | verify: 0 mismatches. A long max-clock 720p run through the heaviest stages and bosses fed round 13 |
+| `unleashed-test-round13` | round 13 | — | clearly faster in Jungle Joyride act 1's intensive scenes | verify: 0 mismatches over 2 million native calls (the light field included). The dark eyes stayed in configs 1, eyes-a and eyes-e |
+| `unleashed-test-round14` | round 14 | (config 4: GPU pass and draw report) | (pending) | eyes against Mesa 26.2.3 (eyes-f) and with every drawing switch off (eyes-g) |
+| `unleashed-test-round15` | round 15 | 39.7 FPS; 37.7 with the round 15 GPU switches off (a new test spot) | faster with the round 15 CPU changes | eyes still dark, also with the copy engine (eyes-h) |
+| `unleashed-test-round16-eyes` | round 16 | — | — | driver instrumentation: the driver compiles the eye shaders correctly; the cause was the translator |
+| `unleashed-test-round16-fix` | round 16 | — | — | the eyes right again (confirmed on the console); the round 16 PGO profile collected |
+
+From test set 11 on, a test set carries the number of the round that built it.
 
 ## Building
 
@@ -50,7 +66,29 @@ limits the frame.
 | `SWITCH_IPA_PTA` | 0 | `-fipa-pta` at compile and LTO link (round 10) |
 | `SWITCH_RECOMP_O2` | 0 | `-O2` for the recompiled code only |
 | `SWITCH_CLASSIC_CODEGEN` | 0 | the pre-round-8 code generation, for A/B builds |
+| `SWITCH_LEAF_LOCALS` | 0 | round 11: functions that call nothing keep the context's registers in locals (`tools/switch-codegen-pass.py`) |
+| `SWITCH_WIDE_DFORM` | 0 | round 11: register + displacement accesses as 64-bit addresses (guard page in `kernel/memory.cpp`) |
+| `SWITCH_CONST_VMX_TABLES` | 0 | round 11: VMX byte-order tables as constants, table shuffles as NEON TBL |
+| `SWITCH_NARROW_BARRIER` | 0 | round 11: loop barriers on guest memory only |
+| `SWITCH_INLINE_FP_COMPARE` | 0 | round 12: the floating-point compare branchless and always inlined |
+| `SWITCH_INLINE_MEMCPY` | 0 | round 14: guest `memcpy`/`memset` with a constant size inlined, the other `memcpy`/`memmove`/`memset` calls straight to the C library |
+| `SWITCH_FEWER_MODE_SWITCHES` | 0 | round 14: `1` XenonRecomp keeps a known FPCR flush mode for instructions whose result does not depend on it; `2` also an unknown one (for a build whose PGO profile is collected with it) |
+| `SWITCH_EXPLICIT_FMA` | 0 | round 15: only the guest's own fused multiply-adds are fused (`__builtin_fma`, `PPCVectorFma`), everything compiled with `-ffp-contract=off`; the code generation pass then also processes floating-point functions; the localized main-thread clusters need it |
+| `SWITCH_SCALAR_RSQRT` | 0 | round 15: `vrsqrtefp`/`vrefp` of a dot product computed in the same block (all four lanes equal) as one scalar `1/sqrt` or `1/x`, splatted |
+| `SWITCH_FIRST_TARGETS` | empty | ninja targets built first (the hand-edited sources), so their errors show before the long compile |
 | `SWITCH_BUILD_ID` | date and options | printed as the first line of `stderr.log` |
+
+The test NROs of rounds 11-13 set all five code generation options, with PGO (the round-8 profile), LTO, `-O2` and
+`-fipa-pta`; round 14 adds `SWITCH_FEWER_MODE_SWITCHES=1` (`SWITCH_INLINE_MEMCPY` waits for a new PGO profile), round 15
+`SWITCH_EXPLICIT_FMA=1` and `SWITCH_SCALAR_RSQRT=1`. Without `SWITCH_EXPLICIT_FMA` the code generation pass leaves every
+function with double-precision or vector floating-point arithmetic exactly as XenonRecomp wrote it: GCC fuses a
+multiply and a later add whenever it sees the product flow into the add (`-ffp-contract=fast`), and more visible data
+flow could change where it does. With it, no contraction happens anywhere, so every statement rounds as the guest's
+instruction does and the pass may process those functions too.
+
+`tools/build-switch.sh` also runs `tools/switch-localize.py` after the recompiled sources are generated (round 15): the
+copies of recompiled functions with their registers in locals (`UnleashedRecompLib/switch/localized_*.inl`) are always
+made from the build's own code.
 
 The script resets the submodules and applies `patches/*.patch`, so changes to XenosRecomp, XenonRecomp or plume
 have to be written back into their patch files before a build. The shader cache is regenerated whenever the
@@ -71,7 +109,7 @@ translator or `shader_common.h` changes.
 | Redundant shader constant updates skipped | `gpu/video.cpp` | CPU (render thread), memory bandwidth | on | — |
 | Render-thread buffer unlocks staged through the upload ring | `gpu/video.cpp` | CPU (render thread) | on | — |
 | GPU timer corrected (NVK timestamps are 1.627 ns, not 1 ns) | `gpu/video.cpp` | measurement only | on | — |
-| Stock 460.8 MHz handheld GPU profile (memory stays at 1331.2 MHz) | `os/switch/perf_switch.cpp` | GPU in handheld | **off** | `[Switch] SwitchHandheldGpuBoost = true` to enable |
+| Stock 460.8 MHz handheld GPU profile (memory stays at 1331.2 MHz) | `os/switch/perf_switch.cpp` | GPU in handheld | **on** (1.0.0) | `[Switch] SwitchHandheldGpuBoost = false` to disable |
 | FPS, frame times and resolution for Status Monitor / SaltyNX overlays | `os/switch/overlay_switch.cpp`, `gpu/video.cpp` | overlays | on | `[Switch] SwitchOverlayFps = false` |
 | Requests the patched driver's self-checking draw-path fast paths (it runs them only for games that ask; see SWITCH-MESA.md) | `gpu/video.cpp` | CPU (render thread), needs that driver | **off** since round 7 | `[Switch] SwitchNvkFastPaths = true` |
 | Profile-guided optimisation (instrumented build + profile use) | `UnleashedRecomp/CMakeLists.txt`, `os/switch/pgo_switch.cpp`, `tools/build-switch.sh` | CPU | **off** | `SWITCH_PGO=generate` / `use` |
@@ -89,7 +127,7 @@ translator or `shader_common.h` changes.
 | Shader constants kept in host byte order (swap on set, copy on upload) | `gpu/video.cpp` | CPU (render thread) | on | — |
 | `-fno-math-errno -fno-trapping-math` for the recompiled code | `UnleashedRecompLib/CMakeLists.txt` | CPU (game code) | on | remove the block |
 | Driver link for current mesa-switch builds (optional expat/drm_nouveau, link group, weak libelf stubs) | `patches/plume-switch-perf.patch`, `os/switch/nvk_switch_stubs.c`, `tools/build-switch.sh` | build | on | — |
-| stderr written to `sdmc:/switch/UnleashedRecomp/stderr.log` | `main.cpp` | diagnostics | on | — |
+| stderr written to `stderr.log` next to the NRO | `main.cpp` | diagnostics | off (1.0.0) | `[Switch] SwitchLog` |
 | Driver environment variables from the config | `gpu/video.cpp` | testing | empty | `[Switch] SwitchMesaEnvironment` |
 | Vertex shaders skip the reverse-Z pass when reverse Z is off | `patches/XenosRecomp-switch-perf.patch` | GPU (vertex) | on | revert the patch |
 | Per-pass GPU profiler | `gpu/video.cpp` | measurement | off | `[Switch] SwitchGpuPassProfiler = true` |
@@ -153,23 +191,55 @@ translator or `shader_common.h` changes.
 | Alpha-test sinking also for fetches and derivatives, per 2x2 quad whose pixels are all discarded (round 9) | `patches/XenosRecomp-switch-perf.patch`, `gpu/video.cpp` | GPU (pixel) | **off** since round 10 (slower) | `[Switch] SwitchAlphaTestQuadSink = true` to enable |
 | Draws that copy a target's own pending resolve back into it (EDRAM restores) skipped (round 9) | `patches/XenosRecomp-switch-perf.patch` (`SHADER_FLAG_*`), `gpu/video.cpp` | GPU | on | `[Switch] SwitchSkipRestoreDraws = false` |
 | The game's LZX decompression as native code (round 9) | `misc_impl.cpp`, `os/switch/lzx_switch.cpp` | CPU (loading, streaming) | on | `[Switch] SwitchNativeDecompress = false`; `SwitchVerifyNativeDecompress = true` compares |
-| Guest critical sections skip the wake-up call when nobody waits (round 9) | `kernel/imports.cpp` | CPU (all game threads) | **off** (audio test pending) | `[Switch] SwitchFastCriticalSections = true` to enable |
-| Guest events and semaphores skip their wake-up calls when nobody waits (round 9) | `kernel/imports.cpp` | CPU (all game threads) | **off** (audio test pending) | `[Switch] SwitchFastEvents = true` to enable |
+| Guest critical sections skip the wake-up call when nobody waits (round 9) | `kernel/imports.cpp` | CPU (all game threads) | on since the final build | `[Switch] SwitchFastCriticalSections = false` |
+| Guest events and semaphores skip their wake-up calls when nobody waits (round 9) | `kernel/imports.cpp` | CPU (all game threads) | on since the final build | `[Switch] SwitchFastEvents = false` |
 | Command batches handed to the render thread as their buffer, not copied (round 9) | `gpu/video.cpp` | CPU (game thread) | on | `[Switch] SwitchZeroCopyBatches = false` |
 | Stall watchdog ("[stall]", "[hitch]" lines) (round 9) | `os/switch/stall_watch_switch.cpp` | diagnostics | 1 s | `[Switch] SwitchStallWatchSeconds = 0` |
 | Frame log: one frame's GPU work, in order, once a minute (round 9) | `gpu/video.cpp` | diagnostics | off | `[Switch] SwitchFrameLog = true` |
-| Pending resolves whose texture is resolved into again before any read are dropped, not copied (round 10) | `gpu/video.cpp` | GPU (bandwidth) | on | `[Switch] SwitchSkipDeadCopies = false` |
+| Pending resolves whose texture is resolved into again before any read are dropped, not copied (round 10) | `gpu/video.cpp` | GPU (bandwidth) | **off** since the final build (GPU loss) | `[Switch] SwitchSkipDeadCopies = true` |
 | More of each alpha-tested shader after the per-pixel test: shared temporaries for shadow filters, per-component statements, movable light loops (round 10) | `patches/XenosRecomp-switch-perf.patch` | GPU (pixel) | on with the sinking | `[Switch] SwitchAlphaTestSink = false` |
-| Depth clears the next draw overwrites entirely not made; others made in the draw's pass (round 10) | `gpu/video.cpp` | GPU | on | `[Switch] SwitchSkipOverwrittenDepthClears = false` |
-| Waiting colour clears made in the pass that draws into their target (round 10) | `gpu/video.cpp` | GPU (fewer passes) | on | `[Switch] SwitchCarryClears = false` |
-| Depth buffers with pending resolves ready for sampling at the change of target (round 10) | `gpu/video.cpp` | GPU (no mid-pass barrier) | on | `[Switch] SwitchEagerDepthTransitions = false` |
-| Submit, present, frame fence and next image on the render thread (round 10) | `gpu/video.cpp` | CPU (game thread) | **off** (test configs on) | `[Switch] SwitchPresentOnRenderThread = true` to enable |
+| Depth clears the next draw overwrites entirely not made; others made in the draw's pass (round 10) | `gpu/video.cpp` | GPU | **off** since the final build (GPU loss) | `[Switch] SwitchSkipOverwrittenDepthClears = true` |
+| Waiting colour clears made in the pass that draws into their target (round 10) | `gpu/video.cpp` | GPU (fewer passes) | **off** since the final build (GPU loss) | `[Switch] SwitchCarryClears = true` |
+| Depth buffers with pending resolves ready for sampling at the change of target (round 10) | `gpu/video.cpp` | GPU (no mid-pass barrier) | **off** since the final build (GPU loss) | `[Switch] SwitchEagerDepthTransitions = true` |
+| Submit, present, frame fence and next image on the render thread (round 10) | `gpu/video.cpp` | CPU (game thread) | on since the final build | `[Switch] SwitchPresentOnRenderThread = false` |
 | Batches of up to 512 commands while the render thread waits (round 10) | `gpu/video.cpp` | CPU (game thread) | on | `[Switch] SwitchIdleRenderThreadBatches = false` |
 | Render thread priority (round 10) | `gpu/video.cpp` | CPU (scheduling) | 0x2D (45) | `[Switch] SwitchRenderThreadPriority` |
-| Guest spin locks spin ~2 µs before sleeping (round 10) | `kernel/imports.cpp` | CPU (all game threads) | **off** (audio test pending) | `[Switch] SwitchGuestSpinBeforeSleep = true` to enable |
+| Guest spin locks spin ~2 µs before sleeping (round 10) | `kernel/imports.cpp` | CPU (all game threads) | on since the final build | `[Switch] SwitchGuestSpinBeforeSleep = false` |
 | Thread-local reads removed from hot paths: D3D-thread test by register, critical sections, RTTI and UI caches (round 10) | `gpu/video.cpp`, `kernel/imports.cpp`, `misc_impl.cpp`, `patches/aspect_ratio_patches.cpp` | CPU (game thread) | on | — |
 | Pipeline cache keyed by the driver build, so it survives rebuilds of the rest of the NRO (round 10) | `gpu/video.cpp`, `patches/plume-switch-perf.patch`, `UnleashedRecomp/CMakeLists.txt` | loading, first use | on | `SwitchPipelineCache = false` |
 | PGO, LTO, `-O2` and `-fipa-pta` together (round 10) | `CMakeLists.txt`, `tools/build-switch.sh` | CPU | the round 10 test NRO | `SWITCH_PGO`, `SWITCH_LTO`, `SWITCH_O2`, `SWITCH_IPA_PTA` |
+| Message dispatch of 227 handlers by one type lookup instead of up to 200 type comparisons (round 11) | `patches/message_dispatch.cpp`, `message_dispatch_list.inl`, `tools/switch-message-dispatch.py` | CPU (game thread) | on (round 14) | `[Switch] SwitchNativeMessageDispatch = false`; `SwitchVerifyMessageDispatch = true` compares |
+| `type_info` comparisons between the image's own descriptors decided by identity (all 8,368 names differ) (round 11) | `misc_impl.cpp`, `patches/message_dispatch.cpp` | CPU (game thread) | on (round 14) | `[Switch] SwitchExactTypeInfoSet = false` |
+| Native map find (6 copies), quaternion decoder, bone palette upload, render-layer mask test (round 11) | `patches/native_hot_patches.cpp` | CPU (game thread) | on (round 14) | `SwitchNativeMapFind`, `SwitchNativeQuatDecode`, `SwitchNativeBonePalette`, `SwitchNativeLayerMaskTest`; `SwitchVerifyNativeHotFunctions = true` compares |
+| Present waits for the previous frame's recording at its start, not for its own (round 11) | `gpu/video.cpp` | CPU (game thread) | on (round 14) | `[Switch] SwitchPresentWithoutRecordWait = false` |
+| CRI mixer kernels (reverb, mix, voice) run with their registers in machine registers (round 11) | `patches/audio_dsp_patches.cpp`, `UnleashedRecompLib/switch/`, `tools/switch-localize.py` | CPU (sound mixer) | on (round 14) | `SwitchNativeReverb`, `SwitchNativeMixKernels`, `SwitchNativeVoiceKernels`; `SwitchVerifyNativeAudio = true` compares |
+| LZX decoder with its state in registers (round 11) | `os/switch/lzx_switch.cpp` | loading | on (round 14) | `[Switch] SwitchFastNativeDecompress = false` |
+| Pipeline cache saved only after real misses (round 11) | `gpu/video.cpp`, `patches/plume-switch-perf.patch` | boot, SD writes | on (round 14) | `[Switch] SwitchPipelineCacheSaveOnMiss = false` |
+| Guest FindFirstFile from directory entries; read-only guest files on libnx handles (round 11) | `kernel/io/file_system.cpp` | loading | on (round 14) | `SwitchNativeFindFile`, `SwitchNativeFileHandles` |
+| Leaf locals, 64-bit D-form addresses, constant VMX tables, narrow loop barriers (round 11) | `tools/switch-codegen-pass.py`, `patches/XenonRecomp.patch`, `kernel/memory.cpp` | CPU (all game code) | in the test NROs | `SWITCH_LEAF_LOCALS`, `SWITCH_WIDE_DFORM`, `SWITCH_CONST_VMX_TABLES`, `SWITCH_NARROW_BARRIER` |
+| Resource waits poll the loader every 0.5 ms instead of 5 ms (round 12) | `patches/native_hot_patches.cpp`, `kernel/imports.cpp` | CPU (loading during play) | on (round 14) | `[Switch] SwitchFastResourceWaits = false` |
+| Floating-point compare inlined and branchless (11,669 call sites) (round 12) | `patches/XenonRecomp.patch` (`ppc_config.h` define) | CPU (all game code) | in the test NROs | `SWITCH_INLINE_FP_COMPARE` |
+| Native render-walk visibility test, CRI handle search, name compare (round 12) | `patches/native_hot_patches.cpp` | CPU (game thread) | on (round 14) | `SwitchNativeVisibilityTest`, `SwitchNativeCriHandleSearch`, `SwitchNativeNameCompare` |
+| RtlLeaveCriticalSection without its redundant fence (round 12) | `kernel/imports.cpp` | CPU (all game threads) | on (round 14; played in rounds 12-13) | `[Switch] SwitchLeanCriticalSectionLeave = false` |
+| Slow-frame CPU profile, render-thread pipeline creations, per-core split, 8-deep wait stacks; verify one call in N (round 12) | `os/switch/cpu_profiler_switch.cpp`, `gpu/video.cpp` | measurement | off | `SwitchSlowFrameProfileMs`, `SwitchVerifyEvery` |
+| Light-field cell sample (8 record decodes, 6 of its 7 blends) as native code with one flush-to-zero section (round 13) | `patches/native_hot_patches.cpp` | CPU (game thread) | on (round 14) | `[Switch] SwitchNativeLightField = false` |
+| Visibility test prefetches the two lines it will wait for, two entries ahead (round 13) | `patches/native_hot_patches.cpp` | CPU (game thread) | on (round 14) | `[Switch] SwitchRenderWalkPrefetch = false` |
+| The game's `dcbt`/`dcbtst` cache hints as host prefetches (293 places) (round 13) | `patches/XenonRecomp.patch` (`PPC_PREFETCH`) | CPU (all game code) | on | revert the patch |
+| Buffer and texture locks wait only for that object's earlier-frame unlocks (round 13) | `gpu/video.cpp`, `gpu/video.h` | CPU (game thread) | on (round 14) | `[Switch] SwitchPerResourceLockWait = false` |
+| Repeated vibration stops not sent again (round 13) | `hid/driver/switch_hid.cpp` | CPU (game thread, IPC) | on (round 14) | `[Switch] SwitchVibrationDedupe = false` |
+| Gamma pass skips `pow` when every exponent is 1 (round 13) | `gpu/shader/gamma_correction_ps.hlsl` | GPU | on | — |
+| GPU slow-frame report: passes and draw groups by the time they add in slow frames (round 13) | `gpu/video.cpp`, `tools/switch-gpu-profile.py` | measurement | off | `[Switch] SwitchGpuSlowFrameMs` |
+| Driver (NAK revision 5): Maxwell operand reuse opt-in again (round 13) | Mesa `nak/api.rs`, `nvk_shader.c` | GPU | off | `NAK_DEBUG=reuse` (or `reusebasic`) to enable |
+| Event sets and semaphore releases wake only the multi-object waits that wait on them (round 14) | `kernel/imports.cpp` | CPU (all threads) | off until played | `[Switch] SwitchTargetedDispatcherWakeups` |
+| A semaphore release of one unit wakes one waiter (round 14) | `kernel/imports.cpp` | CPU (worker threads) | off until played | `[Switch] SwitchSemaphoreWakeOne` |
+| Critical-section enter with a strong compare-and-swap (round 14) | `kernel/imports.cpp` | CPU (all threads) | off until played | `[Switch] SwitchStrongCriticalSectionCas` |
+| Critical-section enter watches the owner ~2 µs before it waits in the kernel (round 14) | `kernel/imports.cpp` | CPU (all threads) | off until played | `[Switch] SwitchCriticalSectionSpin` |
+| UI modifier lookups that miss the cache use a hash index (round 14) | `patches/aspect_ratio_patches.cpp` | CPU (game thread) | off until played | `[Switch] SwitchModifierIndex` |
+| Fixed-size guest `memcpy`/`memset` inlined; the other `memcpy`/`memmove`/`memset` calls straight to the C library (round 14) | `tools/switch-codegen-pass.py` | CPU (all game code) | build option | `SWITCH_INLINE_MEMCPY` |
+| Fewer FPCR mode switches: instructions whose result does not depend on the flush mode keep a known one (round 14) | `patches/XenonRecomp.patch` (`recompiler.cpp`, `ppc_context.h`) | CPU (all game code) | build option | `SWITCH_FEWER_MODE_SWITCHES` |
+| Hot-function list: the round 6 list plus 353 integer-only functions hot in round 13 (round 14) | `UnleashedRecompLib/config/hot_functions.txt` | CPU | on | revert the list |
+| Driver operand reuse asked for by the game (round 14) | `gpu/video.cpp` | GPU | off until played | `[Switch] SwitchOperandReuse` |
+| CPU slow-frame report: only the frames the game's main thread presents (round 14) | `os/switch/cpu_profiler_switch.cpp` | measurement | off | `[Switch] SwitchSlowFrameProfileMs` |
 
 The constant-buffer path needs a shader cache generated by the patched XenosRecomp. `tools/build-switch.sh`
 now regenerates the cache when the translator inputs change (`shader_cache.cpp.translator` stamp). With an
@@ -255,8 +325,8 @@ measured no difference at the hub, so the game no longer asks for them unless `S
 **PGO.** Two builds from the same build folder, without regenerating code or editing sources in between:
 
 1. `SWITCH_PGO=generate tools/build-switch.sh` (LTO off). Play for as long as possible: title screen, menus,
-   day and night stages, hub worlds, cutscenes, the werehog. Every 3 minutes the game writes `.gcda` files to
-   `sdmc:/switch/UnleashedRecomp/pgo/` (the timings go to `dumps.txt` there).
+   day and night stages, hub worlds, cutscenes, the werehog. Every 3 minutes the game writes `.gcda` files to the
+   `pgo` folder next to the NRO (the timings go to `dumps.txt` there).
 2. Copy those files into `pgo/` in the repository (or `SWITCH_PGO_DIR`), then
    `SWITCH_PGO=use SWITCH_LTO=1 tools/build-switch.sh`.
 
@@ -919,7 +989,7 @@ without sinking keep the same bodies.
    remember, per thread, the result for pairs of type_infos in the executable's image, whose names never change;
    the same object is the same name.
 8. **PGO, collecting**: an instrumented NRO (`SWITCH_PGO=generate`, no LTO) writes its profile to
-   `sdmc:/switch/UnleashedRecomp/pgo/` every 3 minutes; the next build uses it with LTO (`SWITCH_PGO=use`).
+   `pgo` folder next to the NRO every 3 minutes; the next build uses it with LTO (`SWITCH_PGO=use`).
 
 The GPU report also shows where the game's thread spends a frame: its own work, then in Present the waits for the
 render thread, the present, the GPU and the next image, and the frame limiter. At the 60 FPS cap the frame rate
@@ -1073,8 +1143,8 @@ Scale option shows and changes the current mode's, and its reset gives that mode
 (`SwitchCpuProfiler`, `SwitchGpuPassProfiler`, `SwitchGpuDrawProfiler`) and the frame log stay off, and the stall
 watchdog is off (`SwitchStallWatchSeconds = 0`; 1 for tests, with `SwitchLog`).
 
-**Crash reports** (`os/switch/crash_switch.cpp`), whatever `SwitchLog` says, appended to
-`sdmc:/switch/UnleashedRecomp/crash.log`:
+**Crash reports** (`os/switch/crash_switch.cpp`), appended to `crash.log` next to the NRO (since 1.0.0 only with
+`SwitchLog`; the handler breaks either way, so Atmosphère writes its own report):
 
 - A CPU exception: the libnx user exception handler (after `nx_crash_handler.c` of the battd_nx port) writes the
   thread, the fault (pc, lr, far, esr), the registers, the frame-pointer chain, the return addresses found on the
@@ -1088,6 +1158,332 @@ watchdog is off (`SwitchStallWatchSeconds = 0`; 1 for tests, with `SwitchLog`).
 
 `python tools/switch-cpu-profile.py crash.log --elf <the ELF of that NRO>` names the `+0x` offsets of the `[crash]`
 lines.
+
+## Round 11: CPU, native dispatch, mixer kernels, code generation (test set `unleashed-test-round11`)
+
+After the final build the game was mostly limited by its main thread. Round 11 put 14 runtime changes and four code
+generation options into one NRO (the user asked for one build); each runtime change has its own key.
+
+- **Message dispatch.** The player and 226 other objects find a message's handler by comparing its type with up to 200
+  types in turn. `tools/switch-message-dispatch.py` lists the 227 dispatchers; at boot `patches/message_dispatch.cpp`
+  decodes each into a table (1,774 types) and answers with one lookup. Verify mode runs the game's own dispatcher and
+  compares its choice.
+- **Exact `type_info` set.** The 8,368 type descriptors of the image all have different names (checked at boot), so
+  two different ones are never equal: no string compare for those.
+- **Native hot functions:** the material parameter `std::map::find` (six copies), the animation quaternion decoder,
+  the bone palette upload and the render-layer mask test. Each runs only if the guest code is the one it was written
+  from (FNV hash at boot); verify mode compares registers and memory with the recompiled code.
+- **Present without the record wait.** Present returns once the frame's commands are handed over; the next Present
+  (or a buffer lock, see round 13) waits for the render thread instead.
+- **CRI mixer kernels.** The reverb, buffer fill and mix, ADPCM decoder, IIR filter and resampler run copies of the
+  recompiled bodies with the registers in a local struct (`tools/switch-localize.py`), so they stay in machine
+  registers. The game's main thread waits for the mixer's lock, so this shortens its waits too.
+- **Loading:** LZX with its state in registers, the pipeline cache written only after misses, directory listings
+  without a query per file, file sizes from the open handle.
+- **Code generation** (`tools/switch-codegen-pass.py`): leaf functions keep the context's registers in locals (all
+  possibly written registers are written back at every return: MSVC's interprocedural allocation lets callers read
+  volatile registers), D-form accesses as 64-bit addresses, constant VMX tables, loop barriers that do not cover the
+  context. Functions with double-precision or vector floating-point arithmetic are left alone (see Building).
+
+Result: 57.7 FPS against 52 with the switches off, at 858x482 with the CPU at 1020 MHz.
+
+## Round 12: frame dips (test set `unleashed-test-round12`)
+
+The round 11 log showed the big dips (48-80 ms of game-thread time) were mostly waiting: for data still loading, for
+the sound mixer's lock and for events.
+
+- **Resource waits.** Five game loops pump the database loader and `Sleep(5)` until a resource is ready; they now poll
+  every 0.5 ms (only the host sleep is shorter).
+- **Inlined floating-point compare** (`SWITCH_INLINE_FP_COMPARE`): 11,669 out-of-line calls became branchless inline
+  code; the recompiled code shrank by 1.6 %. A compare has nothing to round, so it applies to every function.
+- **Native** render-walk visibility test (it runs for every mesh in every pass), CRI handle search (a mask instead of
+  two divisions per entry), resource-name compare.
+- **Critical-section leave** without the fence before it reads the waiter count (the release store and the acquire
+  load are already ordered).
+- **Diagnostics:** a slow-frame CPU profile (it sampled the wrong thread until round 13), render-thread pipeline
+  creations and their time, a per-core split of each thread's CPU use (wrong until round 13), 8-deep wait stacks,
+  `pipelines.bin.tmp` recovery, and verification of one call in `SwitchVerifyEvery`.
+
+Result: 59 FPS at the hub against 58.0, and 5 or more FPS higher in explosions and large impacts. The PGO profile in
+use (round 8) no longer matches 9,956 functions (their control flow changed since round 9), among them hot ones; a
+collection NRO came with rounds 12 and 13 but has not been played yet.
+
+## Round 13: light field, prefetches, GPU slow frames (test set `unleashed-test-round13`)
+
+From the round 12 max-clock run through the heaviest stages and bosses.
+
+- **Light field** (`SwitchNativeLightField`). Every object's ambient light is a sample of the stage's light field:
+  82E2B780 decodes the cell's 8 corner records (25 bytes each: `(byte / 256)^2` for 24 values, byte 24 times 1/255)
+  and blends them trilinearly in seven lerps. In light-heavy stages that was up to 20 % of the main thread, and a
+  quarter of its samples were on the FPCR writes that switch between the vector unit's flush-to-zero mode and the
+  scalar mode, two per helper call (about 30 per sample). The native version decodes and blends six times with one
+  flush-to-zero section, computing each value as the recompiled code does (GCC had fused every `vmaddfp` into `fmla`;
+  the scalar part is `fmuls`, `fsubs`, fused `fmadds`), writes the two buffers the last blend reads, and calls the
+  recompiled lerp for the seventh, so every register ends as before. 3 FPCR writes instead of about 30.
+- **Render-walk prefetch** (`SwitchRenderWalkPrefetch`): the visibility test waits for the mesh's word +32 and the pass
+  override list; it now prefetches both for the entry two ahead (read only within the current entry's 4 KB page).
+- **The game's prefetches.** XenonRecomp dropped `dcbt`/`dcbtst`; they are host prefetches now (293 places, among them
+  the render walk's next group and next mesh). A prefetch changes no value.
+- **Per-object lock waits** (`SwitchPerResourceLockWait`): with Present not waiting for the recording, a buffer or
+  texture lock waited for the whole previous frame. Each object now counts its unlocks the render thread has not copied
+  yet, and a lock waits only for that object's, only if they come from an earlier frame.
+- **Vibration** (`SwitchVibrationDedupe`): the game stops the motors every frame, one HID IPC each; a stop is now sent
+  once. Any speed other than 0 is still sent every time.
+- **Gamma pass:** with the default brightness and colour settings every exponent is 1; the input and the target are
+  8-bit, so `pow` could not change a stored value, and it is skipped.
+- **GPU slow-frame report** (`SwitchGpuSlowFrameMs`), merged over a log by `tools/switch-gpu-profile.py`; CPU slow
+  frames fixed, per-core figures fixed, profile lines with three decimals.
+- **Driver:** operand reuse opt-in again (NAK revision 5), as the prime suspect for the dark eyes. It was not the cause.
+
+Considered and not done (round 13): native particle walks (five functions that differ in detail, small gain), inlined
+fixed-size `memcpy` calls (it would change the control flow of hundreds of functions and lose them their PGO profile
+until a new one is collected), fusing `lvlx`/`lvrx`/`vor` into one unaligned load, constant-copy tweaks (under 0.1 ms).
+
+Result: clearly faster in Jungle Joyride act 1's intensive scenes; 0 mismatches in the verify run. A rebuild moved
+GCC's multiply-add choices in only 7 of 2,834 floating-point functions (188 in round 12).
+
+## Round 14: FPCR mode switches, memcpy, kernel waits (test set `unleashed-test-round14`)
+
+From the round 13 config 1 profile (420 s, hub and stages).
+
+- **Fewer FPCR mode switches** (`SWITCH_FEWER_MODE_SWITCHES=1`). The recompiled code switches the FPCR between the
+  vector unit's flush-to-zero mode and the scalar unit's mode before each instruction that needs the other one, and an
+  `msr fpcr` waits for every floating-point instruction in flight: 5.3 % of the main thread's samples were in the
+  16-byte code lines holding one (up to three quarters of some vector functions' samples). Most of the switches inside
+  vector code were for instructions whose result is the same in either mode: moves (`fmr`, `fabs`, `fneg`, `lfd`,
+  `stfd`...), float loads and stores (`lfs`, `stfs`, `frsp`) and compares (`fcmpu`). Where the vector mode is known,
+  XenonRecomp now keeps it for those: the moves are bit operations anyway, and the loads, stores and compares go
+  through exact helpers that give the scalar mode's result in either mode (tested against the hardware conversion and
+  compare with x86 FTZ/DAZ set, in all four rounding modes: 105 million cases, 0 differences). The mirror case, vector
+  integer/float conversions and the roundings to nearest and towards zero inside scalar code, keeps the scalar mode.
+  Unconditional switches: 9,487 → 4,856. Where the mode is unknown nothing changes, so no branch is added or removed
+  there (202 functions' control flow changes, through the modes known at labels); level 2 also drops the conditional
+  switches before moves (56,225 → 40,918), but changes the control flow of 5,146 functions: for the next PGO profile.
+- **Guest `memcpy`/`memset`** (`SWITCH_INLINE_MEMCPY`): 940 calls with a constant size (`li r5,N` right before) are
+  `__builtin_memcpy`/`__builtin_memset` of that size, so GCC copies small structs with a few loads and stores; the
+  other 873 calls of the hooked `memcpy`, `memmove` and `memset` call the C library's function directly, without the
+  hook's argument marshalling. 183 functions call nothing else and become leaves (`SWITCH_LEAF_LOCALS`). It costs
+  their PGO profile: GCC's profile counts each call site too (a call need not return), so 1,112 of the 1,114 functions
+  with a replaced call no longer match the round-8 profile (round 13 was right to fear it). Best combined with a new
+  profile. Built and checked, but left out of the round 14 NRO (`round14-20261001-2300-...-codegen12-modes1`): with the
+  round-8 profile it cost more profiles than it saves time.
+- **PGO coverage.** Against round 12's build, the round 14 NRO has 434 more functions without a matching profile: 319
+  from the mode change (its exact helpers and the 202 changed control flows) and 108 that hold one of the game's
+  prefetches. Round 13 had assumed a prefetch leaves the profile alone; every one of the 130 functions with one lost it,
+  among them the hottest render-walk and terrain functions, so round 13's NRO already ran those without PGO. A new
+  collection fixes all of it.
+- **Multiply-add check.** Against round 13's ELF, 258 of the 2,834 floating-point functions have a different number of
+  fused multiply-adds, as many with or without the memcpy option, so from the mode change. The ones looked at are GCC
+  duplicating (or no longer duplicating) a function's vector code into both sides of the mode check at its entry: the
+  same operations on each path. 118 change the proportion of fused operations as well, which duplication of part of a
+  function also does; GCC fuses within one basic block, and the change adds no block boundary between two arithmetic
+  instructions, but a function whose profile changed can be inlined differently, which can bring a product and a sum
+  into one block (as in round 12's rebuild, 188 functions). `-ffp-contract=off` with explicit `fma` for the guest's
+  fused instructions would make every rebuild round alike.
+- **Targeted dispatcher wakeups** (`SwitchTargetedDispatcherWakeups`): every event set and semaphore release woke every
+  `KeWaitForMultipleObjects` caller; the CRI sound server spent two thirds of its samples in those wake-ups. Each object
+  now counts the multi-object waits on it, and only a signal of such an object wakes them.
+- **Semaphores wake one** (`SwitchSemaphoreWakeOne`): a release of one unit woke every waiter (the game's worker threads
+  share semaphores); it now wakes one.
+- **Critical sections.** The enter's compare-and-swap was a weak one: a write to the same cache line (the waiter count,
+  for one) made it fail on a free critical section, and the thread then waited up to 1 ms (the wait's safety timeout)
+  for an owner that did not exist; `SwitchStrongCriticalSectionCas` retries such failures. `SwitchCriticalSectionSpin`
+  watches an owned critical section for ~2 µs before waiting in the kernel, as the guest spin locks do since round 9.
+- **UI modifier index** (`SwitchModifierIndex`): the cache misses of the UI's modifier lookups (0.4 % of the main thread)
+  find the path in a hash index instead of the ordered map of every loaded path.
+- **Hot functions**: the round 6 list (a 480p hub run) shared only half its functions with round 13's top 600. The 353
+  of those without double-precision or vector floating-point arithmetic are added (the attribute can change GCC's
+  unrolling and so its multiply-add choices; it stays as it was on the others).
+- **GPU: operand reuse** asked for by the game (`SwitchOperandReuse`, `NAK_DEBUG=reuse`): measured 22.63 → 22.49 ms at the
+  hub in round 10, and ruled out as the eyes' cause in round 13. The driver keeps it opt-in for other games.
+- **CPU slow frames**: only frames the game's main thread presents; the loading screens' presenter (a loader thread
+  sleeping between file reads) made up 30 % of round 13's slow-frame samples.
+- **Eyes**: the same game against Mesa 26.2.3 (danfromtico's SDK, without this fork's patches; that SDK keeps NAK's Rust
+  runtime in `libnak_rs.a`, which plume does not link, so the test build used a copy whose `libvulkan.a` also holds it),
+  and a configuration with every drawing switch off.
+
+Considered and not done (round 14): sinking the shadow filter's point-fetch half below the alpha test (it runs only
+when the gather does not apply, which the renderer's defaults make rare); depth and colour resolves as transfer copies
+(depth images have no transfer-destination use, which keeps them eligible for ZCULL, and the resolve textures take
+part in the hand-overs; the gain on the X1's copy engine is unmeasured); vectorising the CRI mixer kernels (serial
+filters with feedback); fusing `lvlx`/`lvrx` pairs (needs register liveness across interleaved instructions). The
+main pass's heaviest shader (13 shadow gathers) has no translator waste left to remove; the next GPU targets come from
+config 4's per-draw report.
+
+## Round 15: the sound server's work, explicit multiply-adds, main-thread clusters, dead copies (test set `unleashed-test-round15`)
+
+From the round 14 config 1 log (clocks and resolutions changed during the run, so CPU- and GPU-bound stretches), and
+MarathonRecomp-NX's Switch work for three of the GPU changes. Every runtime change has its own `[Switch]` key, off by
+default until a test set has played it; the natives were checked on the PC against the recompiled code they replace.
+
+### CPU
+
+- **Native ADX decoder** (`SwitchNativeAdxDecoder`, `patches/audio_dsp_patches.cpp`). The CRI sound server holds the
+  lock the game's main thread waits for (8 % of the main thread in the stage reports) while it mixes, and the ADX
+  decoder was the largest part of its work (27.7 %). Per sample the guest computes a plain product, a fused
+  multiply-add with the code times the scale, and a second fused multiply-add, each rounded to single, in an order its
+  compiler chose per position (the native follows the same 32-position pattern, read from the listing). The native
+  chain is shorter and gives the same bits: the plain product is one single multiply (the guest's double product is
+  exact), the inner sum one single add (code × scale is exact in single; rounding to double then single is the same as
+  rounding to single once for the sum of two singles, in every rounding mode), the outer step the guest's own double
+  fused multiply-add. Two channels of a frame are decoded interleaved. Every register the recompiled function leaves
+  is set as it leaves it. PC test against the generated function: 900,000 random calls (12 million frames; every
+  rounding mode, flush on and off, stream ends, channel counts 1-12, overlapping buffers), 0 differences; planted
+  errors (one position of the pattern, one exit register, a fused inner step) were all caught.
+- **Resampler loop in single precision** (`SwitchFastAudioResampler`, needs `SwitchNativeVoiceKernels`). The resampler's
+  inner loop (linear interpolation between two input samples) converted every result to single and back between
+  steps. `tools/switch-localize.py` can now replace a loop of a copied function with hand-written code, checked
+  against the loop's exact guest instructions; this one does each `fsubs`/`fadds`/`fmuls` as one single operation and
+  keeps the `fmadds` as the guest's double fused multiply-add rounded to single. PC test: 100,000 loops (30 million
+  samples), 0 differences; the same loop with a single-precision fused multiply-add instead differed 32 times, which
+  is why it stays a double one.
+- **Reverb block loop** (`SwitchLocalizedCriHelpers`): the reverb's block function (83146300) copied with the
+  per-sample step (83154100) inlined, so the 22 registers are loaded and stored once per block instead of once per
+  sample. (The SJ ring-buffer helpers, the other half of that finding, call out and go through vtables: not done.)
+- **Explicit multiply-adds** (`SWITCH_EXPLICIT_FMA`, agreed with the user: match the original): only the guest's own fused
+  instructions are fused (4,325 `__builtin_fma`, 4,635 `PPCVectorFma`, 1,145 `PPCVectorNegatedFms`) and everything is
+  compiled with `-ffp-contract=off`. Before, GCC also fused separate guest multiplies and adds when it saw the data
+  flow (4,134 extra fusions in 1,137 functions of round 14's ELF, single precision included), and any change around
+  them could move one. Now every statement rounds as the Xbox 360 does, and the code generation pass also processes
+  the floating-point functions.
+- **Scalar reciprocal square root of dot products** (`SWITCH_SCALAR_RSQRT`): a `vrsqrtefp` or `vrefp` of a dot product
+  computed in the same block has four equal lanes, so it is one scalar `1/sqrt` or `1/x`, splatted (816 and 3 sites).
+- **Pool allocator** (`SwitchNativePoolAllocator`, `patches/native_r15_pool.cpp`): the engine's small-object pool pop,
+  push and free wrapper (2.3 % of the main thread with their callers). Each took the size class's lock through two
+  virtual calls to one-instruction wrappers of `RtlEnterCriticalSection`/`RtlLeaveCriticalSection`; the natives call
+  those imports directly when the vtable entry is the known wrapper (checked per call; any other target is called as
+  before), with the same loads and stores in the same order. Its verify mode holds the list's lock around both runs.
+- **Material animation** (`SwitchNativeMaterialAnimation`, `patches/native_r15_material.cpp`): the hottest recompiled
+  function of the hub (2.8 %), a keyframe search that stored its key pointer to the context on every step. The native
+  scans with the pointer in a register, computes the value with the generated code's own expressions, and calls the
+  same functions with the same registers. PC test with stub callees (300,000 calls, including times equal to key
+  times): 0 differences in the final registers and in the setter's arguments at every channel. The verify mode
+  compares the setter's arguments at every call too.
+- **Main-thread clusters as localized copies** (`SwitchNativeSplineAnimation`, `SwitchNativePathFollowing`,
+  `SwitchNativeMoppVm`, `patches/native_r15_localized.cpp`): instead of transcribing hundreds of guest instructions by
+  hand, `tools/switch-localize.py` copies the recompiled code with the registers and the FPSCR's cached flush mode in
+  locals. The Havok spline sampler (82FC4390) and the path projection (822D22C8) get their 6 and 12 helpers copied in,
+  so each cluster runs without their calls, prologues and context traffic, and GCC drops a helper's mode switch to
+  the mode already set. Havok's two MOPP machines are recursive (each recursion comes back through the hook), each in
+  a group of its own so a call loads and stores only the registers it uses. The copies are the recompiled statements
+  themselves, so they need `SWITCH_EXPLICIT_FMA` (the file refuses to compile them otherwise). `build-switch.sh` makes
+  them from each build's own recompiled code.
+- **Scene-graph prefetches** (`SwitchSceneGraphPrefetch`): two mid-asm hooks prefetch the next child node of the
+  scene-graph update walk while the current one is processed (39 % and 63 % of those loops' samples were the first
+  touch of the next child).
+- **Larger UI modifier cache** (`SwitchLargeModifierCache`): 4,096 two-way entries instead of 512 direct-mapped ones.
+- **Audio verify mode fix**: since round 11 the logged copies did not log the register + displacement stores
+  (`SWITCH_WIDE_DFORM`), so those stores were neither compared nor undone; they are now.
+- **Round 14's switches** (the four guest-kernel ones and the modifier index) are on by default: played in round 14,
+  the first-cutscene audio check passed. Operand reuse (`SwitchOperandReuse`) too: round 14 showed the eyes dark in
+  every configuration, with it off and with Mesa 26.2.3 as well.
+
+### GPU
+
+- **What each shader samples** (translator): every cache entry has the texture slots its shader can fetch from (its
+  declared samplers; a fetch from an undeclared one would not compile, so every read is covered). The game binds the
+  reflection map and the transparent pass's colour and depth copies for nearly every draw, so "bound" said nothing.
+- **Resolve copies decided at submit** (`SwitchSubmitTimeCopies`). A resolve copy is recorded with a vertex shader
+  (`copy_conditional_vs`) that reads a word the render thread writes just before the frame is submitted, and collapses
+  the triangle to a point when the word is 0. The render thread follows each such texture for the rest of the frame:
+  a draw that can sample its own image (a slot one of its shaders reads; while a resolve into it waits, its slots
+  sample the surface instead), a CPU update, or the frame's end means the copy is drawn; another copy or hand-over
+  into it, a resolve into it from a colour surface (always copied or handed over before the texture's own image can
+  be read again), or its destruction first means nothing can read what the copy would have written. No look-ahead,
+  no waiting. (`vkCmdDrawIndirect` was the other way: this fork's pre-Turing path pushes the macro header before the
+  indirect segment, the order the fork's own comment says kills the channel when a Horizon MME sync is pending.)
+- **Read-only depth sampling** (`SwitchReadOnlyDepthSampling`, from MarathonRecomp-NX): a draw that only tests its depth
+  buffer while sampling one of its pending resolves attaches it read-only (`DEPTH_READ`) and samples the buffer
+  itself, instead of copying it first (the transparent pass's depth copy, ~0.45 ms at 1080p, whenever its draws only
+  test depth). Only for single-sampled D32 buffers whose resolve textures have the buffer's format, size and an
+  identity component mapping.
+- **Bound but unsampled depth resolves** (`SwitchSampledSlotResolves`): with the sampler masks, a pending depth resolve
+  also waits for a draw that only tests the buffer while its texture sits in a slot no shader of the draw samples;
+  the buffer is attached read-only, where those slots can still sample it later.
+- **Late-pass depth restore aliased** (`SwitchDepthRestoreAlias`). After the post chain the game fills a second depth
+  buffer with the main one's values (a full-screen depth-copy draw, ALWAYS with writes) and draws the late pass
+  against it, testing only. The restore is not drawn: the second buffer stands for the main one, which the late draws
+  test read-only. Exact: the restore would have written every pixel (proven full-screen quad, no edge pixels, no
+  discard) with the main buffer's value at that pixel (point sampled, its own texel, a depth already in [0, 1]).
+  Before anything could tell the two apart (a draw writing either buffer, a resolve of the second, a depth clear of
+  the main one, a destruction) the second gets the real copy; when that happens because the main buffer changes, the
+  copy is decided at submit and draws nothing if the second buffer's next use in the frame is its own clear, which
+  is what the game does every frame. Hand-overs of either image wait while the alias holds.
+- **Copies keep the vertex constants** (`SwitchCopyKeepsVertexConstants`, from MarathonRecomp-NX): with the
+  uniform-buffer constants, a resolve copy only clobbers the pushed pointers (pushed again before a draw that reads
+  them); the forced re-upload of the next draw's vertex constants is gone.
+- **Frame queries reset one by one** (`SwitchQueryResetPerQuery`, from MarathonRecomp-NX): NVK resets several queries
+  with a copy-engine fill (a channel switch to the copy engine and back at the start of every frame), one query with a
+  3D-engine semaphore write.
+- **ImGui shader**: the procedural anti-aliasing of the options menu's containers runs only for the modifiers that use
+  it (for the others its four taps all return 1, so the product was a no-op); the options menu cost ~4.4 ms of GPU per
+  frame at 720p and max clock.
+
+Considered and not done (round 15): the quarter-resolution reflection pass discarded when nothing samples it
+(conditional rendering): with resolves kept pending over Present, whether a frame's reflection is ever seen depends
+on the next frame's draws, after its command buffer is submitted, so it cannot be decided exactly. From
+MarathonRecomp-NX, not ported: stable framebuffers (draws turning colour writes off keep the render pass: the pipeline
+key and the variants change; a larger port), the vertex half-swap masks as a specialization constant (translator and
+pipeline key), and its D32 shadow arrays and uniform stencil clears (this port's depth buffers are D32 already and
+have no stencil).
+
+Played on 2026-10-02: at a new GPU test spot, 39.7 FPS with the round 15 GPU switches on and 37.7 with them off; the CPU
+changes were faster too. Every round 15 switch is on by default since.
+
+## Round 16: the dark eyes (test set `unleashed-test-round16-fix`)
+
+The dark character eyes were a bug in this port's shader translator, not in the driver. Round 16 first instrumented
+the driver: NIR and NAK dumps of the eye shaders, interpreters for both, and replacement shaders that showed single
+terms. The driver compiled the shaders correctly. The 0.0.3 translator (whose eyes were right) was then rebuilt, and
+both translators' output evaluated on the same inputs (`tools/switch-shader-audit/`).
+
+- **The bug** (round 9's renaming in the alpha-test sinking): when both halves of a renamed shadow filter stayed in
+  place, the translator printed the filter's original lines instead of its renamed ones. The shadow fetches then read
+  stale coordinates, their results were never read (the shadow tests compared against 0), and in the eye shaders the
+  filter also overwrote the world position before the eye-light code read it. 69 pixel shaders had it:
+  - SonicEye, SonicEnamel, SonicMetal, SuperSonic;
+  - the shadow-receiving Glass, Metal, Ice and Common materials.
+
+  It was in every build since 0.0.4, whatever the switches and the driver. Fixed in the translator; see the audit's
+  translator section.
+- **The check:** all 1,385 shaders against 0.0.3's translation, in every specialization the renderer can use. After
+  the fix, no difference.
+- **The driver** is round 15's again (the round 16 instrumentation is out). Operand reuse stays as it was: off in the
+  driver, asked for by the game.
+
+The whole investigation, step by step, is in [SWITCH-DARK-EYES.md](SWITCH-DARK-EYES.md). The user confirmed the eyes on
+the console and collected the round 16 PGO profile with the fixed build.
+
+## 1.0.0
+
+The release build of round 16's code:
+- **PGO:** the round 16 profile (`pgo/`, collected with the fixed build). The code generation options are the ones
+  it was collected with: fixed-size `memcpy` inlined, FPCR mode level 2, plus every option of round 15. Until now the
+  builds used round 8's profile, and these two options waited for a matching one.
+- **Handheld GPU boost on by default** (`SwitchHandheldGpuBoost`): the stock 460.8 MHz handheld GPU profile that
+  commercial games request, memory unchanged.
+- **No log files by default.** `SwitchLog` (off) now also covers `crash.log`; a crash still leaves Atmosphère's own
+  report. With `SwitchLog = true`, `stderr.log`, `UnleashedRecomp.log` and `crash.log` are written as before.
+- **`config.toml` lists every `[Switch]` option**, with its default the first time. They were hidden before:
+  missing from the file unless typed in, so the per-mode Resolution Scale chosen in the menu was not kept.
+- **Any folder of the SD card:** the game uses the NRO's own folder for the game files, `config.toml`, the saves, the
+  caches, `install/` and the logs. It reads the folder from the path the homebrew menu passes as `argv[0]`
+  (`sdmc:/switch/SonicUnleashed/UnleashedRecomp.nro`, ...), falling back to `sdmc:/switch/UnleashedRecomp`.
+
+## Current state
+
+Defaults (1.0.0): every switch of rounds 11 to 15 is **on**, and so is the handheld GPU boost:
+- rounds 11-13 played in three test sets and verified with 0 mismatches;
+- round 14 played in its test set, its guest-kernel switches through the first-cutscene audio check;
+- round 15 played on 2026-10-02.
+
+The verify modes and profilers are off, and the code generation options are build options. The four round 10 renderer
+changes stay off (see [Final build](#final-build)). Operand reuse is off in the driver and asked for by the game
+(`SwitchOperandReuse`, on).
+
+The dark character eyes are fixed (round 16: a translator bug, see [Round 16](#round-16-the-dark-eyes-test-set-unleashed-test-round16-fix)
+and [SWITCH-DARK-EYES.md](SWITCH-DARK-EYES.md)). The builds use the round 16 PGO profile (see [1.0.0](#100)). No log files
+are written unless `SwitchLog` is on. The game runs from any folder of the SD card.
 
 ## Considered and not done
 
@@ -1120,10 +1516,10 @@ All output-identical:
    samples at 1020 MHz: sleeping 4.3 %, IPC 4.2 %, condition variables 3.1 %, address waits 1.5 %. Since round 10 the
    CPU sampler attributes these to their callers ("wait" lines), which shows which guest sleeps, locks or IPC calls
    to go after.
-2. **A PGO profile from an `-O2` build.** The round 10 build used the round-8 profile, collected from an `-O3`
-   instrumented build: 87 % of the recompiled functions matched it, and the other 8,846 of 66,629 (two of the seven
-   hottest among them) were built without a profile, because `-O2` inlines differently before instrumentation. A
-   collection build with `SWITCH_PGO=generate SWITCH_O2=1` matches the `-O2` release build.
+2. **A new PGO profile.** The builds still use the round-8 profile; 9,956 functions no longer match it (some of the
+   hottest among them). Round 15's test set has the collection build (round 15's code generation with
+   `SWITCH_INLINE_MEMCPY=1` and `SWITCH_FEWER_MODE_SWITCHES=2`, which remove 940 calls and 15,000 conditional mode
+   switches but change many functions' control flow); the next build uses its profile.
 3. **Batched streaming uploads.** Textures loaded on worker threads are uploaded with one submission and one fence
    wait each, on the same single queue as rendering (NVK on Horizon has one queue, and every submit is an IPC call).
    Recording those copies into the next frame's command list would shorten streaming and loading.
@@ -1133,9 +1529,17 @@ All output-identical:
 5. **The rest of the alpha-tested shaders' work before the test.** 332 of the 1,096 shaders with an early-out still
    keep their shadow filter before it, mostly because the alpha itself, or a kept environment-map fetch, depends on
    it; `XENOS_SINK_DEBUG=1` lists why for each statement.
-6. **The transparent pass's copies** (about 1.4 ms at 1080p). The water draw samples the colour and depth it writes,
-   so both are copied first; only a copy limited to the draw's screen area could save part of it, which needs that
-   area on the CPU.
+6. **The transparent pass's copies** (about 1.4 ms at 1080p). Round 15 samples the depth read-only where the pass's
+   draws only test it and leaves a copy undrawn when nothing reads it; the water draw still samples the colour it
+   writes, so that copy stays where water is drawn. A copy limited to the draw's screen area could save part of it,
+   which needs that area on the CPU.
+7. **The sound mixer's lock.** In the heaviest round 12 to 14 reports most of the main thread's system-call samples
+   are waits for the CRI library's critical section, which the mixer holds for its whole mix. Round 15 shortens the
+   mix (ADX decoder, resampler, reverb loop); what remains under the lock is the SJ ring-buffer helpers (calls through
+   vtables) and the mix itself.
+8. **FPCR mode switches** sat on about 5-6 % of the main thread's samples. Round 14 halved the unconditional ones;
+   what is left are scalar arithmetic instructions inside vector code (`fadds`, `fmuls`, `fsqrts`...), whose results
+   differ in the two modes for denormal inputs or results. Exact helpers for those would be longer than a switch.
 
 ## How to measure
 
@@ -1175,4 +1579,4 @@ Checks that each change is active, in `stderr.log`:
 - Audio: `audio gaps since start N` in the pass report.
 - NVK fast paths, when requested: `NVK fast paths: requested (set 4 contract found, draw contract found)`.
 - PGO: `Switch PGO: generate (...)` or `use (...)` at configure time; a collection build writes `.gcda` files and
-  `dumps.txt` to `sdmc:/switch/UnleashedRecomp/pgo/`.
+  `dumps.txt` to the `pgo` folder next to the NRO.

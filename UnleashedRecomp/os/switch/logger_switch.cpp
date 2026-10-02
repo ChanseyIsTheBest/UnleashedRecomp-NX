@@ -6,11 +6,15 @@
 
 #include <fmt/core.h>
 #include <os/logger.h>
+#include <os/process.h>
 
 namespace
 {
-    constexpr const char* kLogDirectory = "sdmc:/switch/UnleashedRecomp";
-    constexpr const char* kLogPath = "sdmc:/switch/UnleashedRecomp/UnleashedRecomp.log";
+    // Next to the NRO, wherever it is on the SD card (os/switch/process_switch.cpp).
+    std::string LogPath()
+    {
+        return (os::process::GetExecutableRoot() / "UnleashedRecomp.log").string();
+    }
     constexpr uint32_t kEarlyFlushLines = 96;
     constexpr uint32_t kFlushInterval = 64;
 
@@ -66,7 +70,7 @@ void os::logger::Init()
     g_logLineCount = 0;
 
     std::error_code ec;
-    std::filesystem::create_directories(kLogDirectory, ec);
+    std::filesystem::create_directories(os::process::GetExecutableRoot(), ec);
 }
 
 void os::logger::SetFileEnabled(bool enabled)
@@ -76,7 +80,7 @@ void os::logger::SetFileEnabled(bool enabled)
     g_fileDecided = true;
     if (enabled && g_logFile == nullptr)
     {
-        g_logFile = fopen(kLogPath, "w");
+        g_logFile = fopen(LogPath().c_str(), "w");
         if (g_logFile != nullptr)
         {
             setvbuf(g_logFile, nullptr, _IOFBF, 64 * 1024);

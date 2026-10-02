@@ -82,6 +82,11 @@ static std::map<const void*, XXH64_hash_t> g_paths;
 #if defined(__SWITCH__)
 // [Switch] SwitchModifierCache (FindModifier). Changes whenever g_paths does (under g_pathMutex).
 static std::atomic<uint32_t> g_pathsGeneration{ 1 };
+
+// [Switch] Round 14, SwitchModifierIndex: the same keys and values as g_paths (under g_pathMutex, kept whether the
+// switch is on or not), hashed, for FindModifierUncached's exact-key lookups; g_paths stays for the range erase. Both
+// keep the first value emplaced for a key, as std::map::emplace does.
+static ankerl::unordered_dense::map<const void*, XXH64_hash_t> g_pathIndex;
 #endif
 
 static XXH64_hash_t HashStr(const std::string_view& value)
@@ -92,9 +97,13 @@ static XXH64_hash_t HashStr(const std::string_view& value)
 static void EmplacePath(const void* key, const std::string_view& value)
 {
     std::lock_guard lock(g_pathMutex);
-    g_paths.emplace(key, HashStr(value));
 #if defined(__SWITCH__)
+    const XXH64_hash_t hash = HashStr(value);
+    g_paths.emplace(key, hash);
+    g_pathIndex.emplace(key, hash);
     g_pathsGeneration.fetch_add(1, std::memory_order_release);
+#else
+    g_paths.emplace(key, HashStr(value));
 #endif
 }
 
@@ -179,6 +188,10 @@ PPC_FUNC(sub_825E2E60)
         auto lower = g_paths.lower_bound(key);
         auto upper = g_paths.lower_bound(key + fileSize);
 
+#if defined(__SWITCH__)
+        for (auto it = lower; it != upper; ++it)
+            g_pathIndex.erase(it->first);
+#endif
         g_paths.erase(lower, upper);
 #if defined(__SWITCH__)
         g_pathsGeneration.fetch_add(1, std::memory_order_release);
@@ -821,11 +834,24 @@ static std::optional<CsdModifier> FindModifierUncached(uint32_t data)
     {
         std::lock_guard lock(g_pathMutex);
 
-        auto findResult = g_paths.find(g_memory.Translate(data));
-        if (findResult == g_paths.end())
-            return {};
+#if defined(__SWITCH__)
+        if (Config::SwitchModifierIndex)
+        {
+            auto indexResult = g_pathIndex.find(g_memory.Translate(data));
+            if (indexResult == g_pathIndex.end())
+                return {};
 
-        path = findResult->second;
+            path = indexResult->second;
+        }
+        else
+#endif
+        {
+            auto findResult = g_paths.find(g_memory.Translate(data));
+            if (findResult == g_paths.end())
+                return {};
+
+            path = findResult->second;
+        }
     }
 
     auto findResult = g_modifiers.find(path);
@@ -841,6 +867,12 @@ static std::optional<CsdModifier> FindModifierUncached(uint32_t data)
 // Threads are told apart by their TLS region (TPIDRRO_EL0), which every thread has its own of.
 static std::atomic<uintptr_t> g_modifierCacheOwner{ 0 };
 static ModifierCacheEntry g_ownerModifierCache[512];
+
+// Round 15, SwitchLargeModifierCache: the owner's cache with 2,048 sets of two entries (4,096 in all) and a one-bit
+// LRU per set, for the conflict misses of the 512 direct-mapped entries (the misses were still 0.7 % of the hub's game
+// thread). The same key (address, generation of the path table) and the same value as before.
+static ModifierCacheEntry g_ownerModifierCacheLarge[2048][2];
+static uint8_t g_ownerModifierCacheVictim[2048];
 
 static uintptr_t CurrentThreadTlsRegion()
 {
@@ -862,7 +894,28 @@ static std::optional<CsdModifier> FindModifier(uint32_t data)
 
         ModifierCacheEntry* cache;
         uint32_t shift;
-        if (owner == self)
+        if (owner == self && Config::SwitchLargeModifierCache)
+        {
+            const uint32_t generation = g_pathsGeneration.load(std::memory_order_acquire);
+            const uint32_t set = (data * 0x9E3779B1u) >> 21;
+            ModifierCacheEntry* ways = g_ownerModifierCacheLarge[set];
+            for (uint32_t way = 0; way < 2; way++)
+            {
+                if (ways[way].generation == generation && ways[way].data == data)
+                {
+                    g_ownerModifierCacheVictim[set] = uint8_t(way ^ 1);
+                    return ways[way].modifier;
+                }
+            }
+
+            auto& entry = ways[g_ownerModifierCacheVictim[set]];
+            g_ownerModifierCacheVictim[set] ^= 1;
+            entry.modifier = FindModifierUncached(data);
+            entry.data = data;
+            entry.generation = generation;
+            return entry.modifier;
+        }
+        else if (owner == self)
         {
             cache = g_ownerModifierCache;
             shift = 23;

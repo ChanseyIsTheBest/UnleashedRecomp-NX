@@ -126,7 +126,15 @@ float4 SampleSdfFont(float4 color, Texture2D<float4> texture, float2 uv, float2 
 float4 main(in Interpolators interpolators) : SV_Target
 {
     float4 color = interpolators.Color;
-    color *= PixelAntialiasing(interpolators.Position.xy - g_PushConstants.ProceduralOrigin);
+    // [Switch] Round 15: for every other modifier SamplePoint returns 1.0 at all four taps, so SampleLinear's lerps of
+    // equal values give exactly 1.0 (fracPart is finite: the clamp bounds the coordinate) and the product changes no
+    // pixel; the branch is uniform (a push constant), so the derivatives inside stay valid.
+    if (g_PushConstants.ShaderModifier == IMGUI_SHADER_MODIFIER_SCANLINE ||
+        g_PushConstants.ShaderModifier == IMGUI_SHADER_MODIFIER_CHECKERBOARD ||
+        g_PushConstants.ShaderModifier == IMGUI_SHADER_MODIFIER_SCANLINE_BUTTON)
+    {
+        color *= PixelAntialiasing(interpolators.Position.xy - g_PushConstants.ProceduralOrigin);
+    }
     
     if (g_PushConstants.Texture2DDescriptorIndex != 0)
     {

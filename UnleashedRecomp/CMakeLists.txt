@@ -182,6 +182,13 @@ set(UNLEASHED_RECOMP_PATCHES_CXX_SOURCES
     "patches/input_patches.cpp"
     "patches/inspire_patches.cpp"
     "patches/misc_patches.cpp"
+    "patches/message_dispatch.cpp"
+    "patches/native_hot_patches.cpp"
+    "patches/native_r15.cpp"
+    "patches/native_r15_pool.cpp"
+    "patches/native_r15_material.cpp"
+    "patches/native_r15_localized.cpp"
+    "patches/audio_dsp_patches.cpp"
     "patches/object_patches.cpp"
     "patches/player_patches.cpp"
     "patches/resident_patches.cpp"
@@ -405,8 +412,9 @@ if (UNLEASHED_RECOMP_SWITCH)
         "NX"
         "VK_USE_PLATFORM_VI_NN"
         "IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS"
-        "GAME_INSTALL_DIRECTORY=\"sdmc:/switch/UnleashedRecomp\""
     )
+    # No GAME_INSTALL_DIRECTORY: the game folder is the NRO's own folder, found at run time (user/paths.h,
+    # os/switch/process_switch.cpp), so the NRO works from any folder of the SD card.
 endif()
 
 find_package(CURL REQUIRED)
@@ -498,7 +506,7 @@ if (UNLEASHED_RECOMP_SWITCH)
     target_include_directories(UnleashedRecomp PRIVATE "${UNLEASHED_RECOMP_SWITCH_GENERATED_DIR}")
 
     # Profile-guided optimisation in two builds (see docs/SWITCH-PERFORMANCE.md):
-    #   generate: instrumented build; the game dumps .gcda files to sdmc:/switch/UnleashedRecomp/pgo
+    #   generate: instrumented build; the game dumps .gcda files to the pgo folder next to the NRO
     #             every 3 minutes (os/switch/pgo_switch.cpp). Build it without LTO.
     #   use:      rebuild with those files copied into UNLEASHED_RECOMP_SWITCH_PGO_DIR.
     # -fprofile-prefix-path makes each .gcda name relative to the build folder, in the host's native
@@ -590,6 +598,7 @@ endfunction()
 
 compile_pixel_shader(blend_color_alpha_ps)
 compile_vertex_shader(copy_vs)
+compile_vertex_shader(copy_conditional_vs)
 compile_pixel_shader(copy_color_ps)
 compile_pixel_shader(copy_depth_ps)
 compile_pixel_shader(csd_filter_ps)

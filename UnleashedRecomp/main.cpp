@@ -28,8 +28,13 @@
 #include <os/switch_cpu_profiler.h>
 #include <os/switch_stall_watch.h>
 #include <os/switch_crash.h>
+#include <os/switch_lzx.h>
 #if defined(__SWITCH__)
 #include <switch_build_id.h>
+#include <patches/message_dispatch.h>
+#include <patches/native_hot_patches.h>
+#include <patches/audio_dsp_patches.h>
+#include <patches/verify_sampling.h>
 #endif
 #include <ui/game_window.h>
 #include <ui/installer_wizard.h>
@@ -285,14 +290,14 @@ int main(int argc, char *argv[])
     Config::Load();
 
 #if defined(__SWITCH__)
-    // [Switch] SwitchLog. stderr carries the renderer's and the driver's own diagnostics (pipeline cache,
-    // overlay, NVK fast paths, ZCULL planes, Mesa warnings, the profilers' reports). Horizon has no console
-    // behind it, so without this they go nowhere. Line-buffered: these messages are rare. The directory
-    // exists: os::logger::Init() creates it.
+    // [Switch] SwitchLog (off by default: no log file is written). stderr carries the renderer's and the driver's own
+    // diagnostics (pipeline cache, overlay, NVK fast paths, ZCULL planes, Mesa warnings, the profilers' reports).
+    // Horizon has no console behind it, so without this they go nowhere. Line-buffered: these messages are rare.
+    // stderr.log goes next to the NRO, like everything else (os/switch/process_switch.cpp).
     os::logger::SetFileEnabled(Config::SwitchLog);
     if (Config::SwitchLog)
     {
-        if (freopen("sdmc:/switch/UnleashedRecomp/stderr.log", "w", stderr) != nullptr)
+        if (freopen((GetUserPath() / "stderr.log").string().c_str(), "w", stderr) != nullptr)
             setvbuf(stderr, nullptr, _IOLBF, 1024);
 
         // First line: which build wrote this log (tools/build-switch.sh sets the ID at configure time).
@@ -309,10 +314,13 @@ int main(int argc, char *argv[])
 #endif
     }
 
-    // crash.log on a CPU exception or a lost GPU, whatever SwitchLog says (os/switch/crash_switch.cpp).
+    // crash.log on a CPU exception or a lost GPU, with SwitchLog only (os/switch/crash_switch.cpp); the crash handler
+    // breaks either way, so Atmosphère writes its own report.
     os::switch_crash::Init(Config::SwitchLog);
 
     os::switch_cpu_profiler::RegisterCurrentThread("main");
+    if (Config::SwitchCpuProfiler)
+        os::switch_cpu_profiler::SetSlowFrameThreshold(uint32_t(std::max<int32_t>(0, Config::SwitchSlowFrameProfileMs)));
     os::switch_cpu_profiler::Start(Config::SwitchCpuProfiler);
     os::switch_stall_watch::Start(Config::SwitchStallWatchSeconds);
 
@@ -326,15 +334,26 @@ int main(int argc, char *argv[])
         extern bool g_verifyNativeDecompress;
         extern bool g_fastCriticalSections;
         extern bool g_fastEvents;
+        extern bool g_leanCriticalSectionLeave;
         extern bool g_guestSpinBeforeSleep;
+        extern bool g_targetedDispatcherWakeups;
+        extern bool g_semaphoreWakeOne;
+        extern bool g_strongCriticalSectionCas;
+        extern bool g_criticalSectionSpin;
         g_guestSpinBeforeSleep = Config::SwitchGuestSpinBeforeSleep;
+        g_targetedDispatcherWakeups = Config::SwitchTargetedDispatcherWakeups;
+        g_semaphoreWakeOne = Config::SwitchSemaphoreWakeOne;
+        g_strongCriticalSectionCas = Config::SwitchStrongCriticalSectionCas;
+        g_criticalSectionSpin = Config::SwitchCriticalSectionSpin;
         g_ppcRelaxedAtomics = Config::SwitchRelaxedAtomics;
         g_nativeRtti = Config::SwitchNativeRtti;
         g_nativeShaderConstants = Config::SwitchNativeShaderConstants;
         g_nativeDecompress = Config::SwitchNativeDecompress;
         g_verifyNativeDecompress = Config::SwitchVerifyNativeDecompress;
+        os::switch_lzx::SetFastDecoder(Config::SwitchFastNativeDecompress);
         g_fastCriticalSections = Config::SwitchFastCriticalSections;
         g_fastEvents = Config::SwitchFastEvents;
+        g_leanCriticalSectionLeave = Config::SwitchLeanCriticalSectionLeave;
     }
 
     if (Config::SwitchHandheldGpuBoost)
@@ -352,7 +371,7 @@ int main(int argc, char *argv[])
         Journal journal;
         double lastProgressMiB = 0.0;
         double lastTotalMib = 0.0;
-        Installer::checkInstallIntegrity(GAME_INSTALL_DIRECTORY, journal, [&]()
+        Installer::checkInstallIntegrity(GetGamePath(), journal, [&]()
         {
             constexpr double MiBDivisor = 1024.0 * 1024.0;
             constexpr double MiBProgressThreshold = 128.0;
@@ -462,6 +481,16 @@ int main(int argc, char *argv[])
     KiSystemStartup();
 
     uint32_t entry = LdrLoadModule(modulePath);
+
+#if defined(__SWITCH__)
+    // [Switch] Round 11 native code of guest functions (patches/message_dispatch.cpp, native_hot_patches.cpp,
+    // audio_dsp_patches.cpp): set up from the loaded image, before guest code runs.
+    g_verifyEvery = uint32_t(std::max<int32_t>(1, Config::SwitchVerifyEvery));
+    InitMessageDispatch(g_memory.base);
+    InitNativeHotFunctions(g_memory.base);
+    InitRound15Natives(g_memory.base);
+    InitAudioDsp();
+#endif
 
     if (!runInstallerWizard)
     {

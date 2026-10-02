@@ -27,10 +27,27 @@
 #   SWITCH_LTO=0           (default) set to 1 for link-time optimisation (needs a lot of build RAM)
 #   SWITCH_LTO_JOBS=2      parallel LTRANS jobs when SWITCH_LTO=1
 #   SWITCH_PGO=            empty (default), "generate" (instrumented build, no LTO) or "use"
-#   SWITCH_PGO_DIR=pgo     folder with the .gcda files copied from sdmc:/switch/UnleashedRecomp/pgo
+#   SWITCH_PGO_DIR=pgo     folder with the .gcda files copied from the pgo folder next to the NRO
 #   SWITCH_RECOMP_O2=0     set to 1 to A/B -O2 instead of -O3 for the recompiled code
 #   SWITCH_O2=0            set to 1 to compile all the code with -O2 instead of -O3
 #   SWITCH_IPA_PTA=0       set to 1 to compile and link with -fipa-pta (whole-program points-to analysis at the LTO link)
+#   SWITCH_LEAF_LOCALS=0   set to 1: leaf functions keep the context's registers in locals (tools/switch-codegen-pass.py)
+#   SWITCH_WIDE_DFORM=0    set to 1: register + displacement loads and stores as 64-bit addresses (same; needs the
+#                          guard page kernel/memory.cpp reserves)
+#   SWITCH_CONST_VMX_TABLES=0  set to 1: VMX byte-order tables as constants, table shuffles as NEON TBL (same)
+#   SWITCH_NARROW_BARRIER=0    set to 1: loop barriers on guest memory only (same)
+#   SWITCH_INLINE_FP_COMPARE=0 set to 1: the floating-point compare branchless and always inlined (same; a define only)
+#   SWITCH_INLINE_MEMCPY=0 set to 1: guest memcpy/memset calls with a constant size as inline builtins, the other
+#                          memcpy/memmove/memset calls straight to the C library (same)
+#                          Functions with double-precision or vector floating-point arithmetic keep XenonRecomp's code.
+#   SWITCH_EXPLICIT_FMA=0  set to 1: the guest's fused multiply-adds as explicit fused operations and everything compiled
+#                          with -ffp-contract=off, so every guest operation rounds as on the Xbox 360 and no code
+#                          generation option can move a rounding; the codegen pass then also handles the floating-point
+#                          functions (XENON_RECOMP_EXPLICIT_FMA; recompiler.h)
+#   SWITCH_SCALAR_RSQRT=0  set to 1: vrsqrtefp/vrefp of a dot product as one scalar operation (XENON_RECOMP_SCALAR_RSQRT)
+#   SWITCH_FEWER_MODE_SWITCHES=0 1: XenonRecomp keeps a known flush mode for instructions whose result
+#                          does not depend on it; 2: also an unknown one, for moves (changes the control flow of
+#                          thousands of functions: for a build with a PGO profile collected with it; recompiler.h)
 #   SWITCH_CLASSIC_CODEGEN=0  set to 1 to A/B the round-7 code generation: ppc/ generated as before it
 #                          (volatile guest memory, all callee-saved stores, FPSCR state per block) and no
 #                          hot-function section. ppc/ is regenerated whenever this or the recompiler changes.
@@ -62,11 +79,28 @@ SWITCH_RECOMP_O2="${SWITCH_RECOMP_O2:-0}"
 SWITCH_O2="${SWITCH_O2:-0}"
 SWITCH_IPA_PTA="${SWITCH_IPA_PTA:-0}"
 SWITCH_CLASSIC_CODEGEN="${SWITCH_CLASSIC_CODEGEN:-0}"
+export SWITCH_LEAF_LOCALS="${SWITCH_LEAF_LOCALS:-0}"
+export SWITCH_WIDE_DFORM="${SWITCH_WIDE_DFORM:-0}"
+export SWITCH_CONST_VMX_TABLES="${SWITCH_CONST_VMX_TABLES:-0}"
+export SWITCH_NARROW_BARRIER="${SWITCH_NARROW_BARRIER:-0}"
+export SWITCH_INLINE_FP_COMPARE="${SWITCH_INLINE_FP_COMPARE:-0}"
+export SWITCH_INLINE_MEMCPY="${SWITCH_INLINE_MEMCPY:-0}"
+SWITCH_FEWER_MODE_SWITCHES="${SWITCH_FEWER_MODE_SWITCHES:-0}"
+export SWITCH_EXPLICIT_FMA="${SWITCH_EXPLICIT_FMA:-0}"
+SWITCH_SCALAR_RSQRT="${SWITCH_SCALAR_RSQRT:-0}"
+SWITCH_CODEGEN_PASS="leaf$SWITCH_LEAF_LOCALS-wide$SWITCH_WIDE_DFORM-tables$SWITCH_CONST_VMX_TABLES-barrier$SWITCH_NARROW_BARRIER"
+# Round 12 options join the id only when set, so ppc/ folders made by round 11 builds keep their id.
+[ "$SWITCH_INLINE_FP_COMPARE" = "1" ] && SWITCH_CODEGEN_PASS="$SWITCH_CODEGEN_PASS-fpcompare1"
+[ "$SWITCH_INLINE_MEMCPY" = "1" ] && SWITCH_CODEGEN_PASS="$SWITCH_CODEGEN_PASS-memcpy1"
+[ "$SWITCH_FEWER_MODE_SWITCHES" != "0" ] && SWITCH_CODEGEN_PASS="$SWITCH_CODEGEN_PASS-modes$SWITCH_FEWER_MODE_SWITCHES"
+[ "$SWITCH_EXPLICIT_FMA" = "1" ] && SWITCH_CODEGEN_PASS="$SWITCH_CODEGEN_PASS-fma1"
+[ "$SWITCH_SCALAR_RSQRT" = "1" ] && SWITCH_CODEGEN_PASS="$SWITCH_CODEGEN_PASS-rsqrt1"
 if [ -z "${SWITCH_BUILD_ID:-}" ]; then
   SWITCH_BUILD_ID="$(date +%Y%m%d-%H%M)"
   [ "$SWITCH_LTO" = "1" ] && SWITCH_BUILD_ID="$SWITCH_BUILD_ID-lto"
   [ "$SWITCH_CLASSIC_CODEGEN" = "1" ] && SWITCH_BUILD_ID="$SWITCH_BUILD_ID-classic"
   [ -n "$SWITCH_PGO" ] && SWITCH_BUILD_ID="$SWITCH_BUILD_ID-pgo-$SWITCH_PGO"
+  [ "$SWITCH_CODEGEN_PASS" != "leaf0-wide0-tables0-barrier0" ] && SWITCH_BUILD_ID="$SWITCH_BUILD_ID-$SWITCH_CODEGEN_PASS"
 fi
 
 if [ "$SWITCH_PGO" = "generate" ] && [ "$SWITCH_LTO" = "1" ]; then
@@ -200,9 +234,10 @@ fi
 
 # ------------------------------------------------------- 4. recompile PPC from XEX
 log "4/7 recompile PPC from default.xex (+ default.xexp title update)"
-# ppc/ belongs to the recompiler that wrote it (its patch) and to its mode: regenerate when either changes.
+# ppc/ belongs to the recompiler that wrote it (its patch), to its mode and to the TOML (functions, mid-asm
+# hooks): regenerate when any of them changes. CMake never regenerates ppc/ (UnleashedRecompLib/CMakeLists.txt).
 codegen_stamp="UnleashedRecompLib/ppc/codegen.txt"
-codegen_id="$(cat patches/XenonRecomp.patch 2>/dev/null | sha256sum | cut -c1-64) classic=$SWITCH_CLASSIC_CODEGEN"
+codegen_id="$(cat patches/XenonRecomp.patch tools/switch-codegen-pass.py UnleashedRecompLib/config/SWA.toml 2>/dev/null | sha256sum | cut -c1-64) classic=$SWITCH_CLASSIC_CODEGEN $SWITCH_CODEGEN_PASS"
 if [ -f UnleashedRecompLib/ppc/ppc_recomp.0.cpp ] && [ "$(cat "$codegen_stamp" 2>/dev/null)" != "$codegen_id" ]; then
   echo "  ppc/ was generated by another recompiler or mode; regenerating"
   # Only the generated files: the folder keeps its tracked .gitignore.
@@ -210,10 +245,13 @@ if [ -f UnleashedRecompLib/ppc/ppc_recomp.0.cpp ] && [ "$(cat "$codegen_stamp" 2
 fi
 if [ ! -f UnleashedRecompLib/ppc/ppc_recomp.0.cpp ]; then
   mkdir -p UnleashedRecompLib/ppc # XenonRecomp does not create it
-  XENON_RECOMP_CLASSIC="$SWITCH_CLASSIC_CODEGEN" \
+  XENON_RECOMP_CLASSIC="$SWITCH_CLASSIC_CODEGEN" XENON_RECOMP_FEWER_MODE_SWITCHES="$SWITCH_FEWER_MODE_SWITCHES" \
+  XENON_RECOMP_EXPLICIT_FMA="$SWITCH_EXPLICIT_FMA" XENON_RECOMP_SCALAR_RSQRT="$SWITCH_SCALAR_RSQRT" \
   build/host-tools/tools/XenonRecomp/XenonRecomp/XenonRecomp.exe \
     UnleashedRecompLib/config/SWA.toml tools/XenonRecomp/XenonUtils/ppc_context.h
   [ -f UnleashedRecompLib/ppc/ppc_recomp.0.cpp ] || { echo "XenonRecomp wrote no code to UnleashedRecompLib/ppc" >&2; exit 1; }
+  # Round 11 code generation options, on XenonRecomp's own output (it refuses a second run on the same ppc/).
+  "$PYTHON" tools/switch-codegen-pass.py || exit 1
   echo "$codegen_id" > "$codegen_stamp"
 else echo "  ppc/ already generated (delete UnleashedRecompLib/ppc to regenerate)"; fi
 
@@ -225,6 +263,10 @@ if [ "$SWITCH_DIRECT_CALLS" = "1" ]; then
 else
   [ -f UnleashedRecompLib/ppc/direct_calls.txt ] && "$PYTHON" tools/switch-direct-calls.py --undo
 fi
+
+# Round 15: the copies of recompiled functions with their registers in locals (the audio kernels, the main-thread
+# clusters) are made from this build's recompiled code, so each copy is the code of the function it replaces.
+"$PYTHON" tools/switch-localize.py || exit 1
 
 # --------------------------------------------------------- 5. generate shaders
 log "5/7 generate shader cache + app shaders"
@@ -297,10 +339,16 @@ PATH="$DEVKITPRO/devkitA64/bin:$PATH" \
   -DUNLEASHED_RECOMP_SWITCH_RECOMP_O2="$([ "$SWITCH_RECOMP_O2" = "1" ] && echo ON || echo OFF)" \
   -DUNLEASHED_RECOMP_SWITCH_O2="$([ "$SWITCH_O2" = "1" ] && echo ON || echo OFF)" \
   -DUNLEASHED_RECOMP_SWITCH_IPA_PTA="$([ "$SWITCH_IPA_PTA" = "1" ] && echo ON || echo OFF)" \
+  -DUNLEASHED_RECOMP_SWITCH_EXPLICIT_FMA="$([ "$SWITCH_EXPLICIT_FMA" = "1" ] && echo ON || echo OFF)" \
   -DUNLEASHED_RECOMP_SWITCH_CLASSIC_CODEGEN="$([ "$SWITCH_CLASSIC_CODEGEN" = "1" ] && echo ON || echo OFF)" \
   -DUNLEASHED_RECOMP_SWITCH_BUILD_ID="$SWITCH_BUILD_ID" \
   "${shader_cache_cmake_args[@]}" \
   -DCMAKE_MAKE_PROGRAM="$NINJA"
+# SWITCH_FIRST_TARGETS="obj1 obj2...": build these ninja targets (e.g. object files of hand-edited sources) first, so
+# that their compile errors show up before the long compile of the recompiled code.
+if [ -n "${SWITCH_FIRST_TARGETS:-}" ]; then
+  PATH="$DEVKITPRO/devkitA64/bin:$PATH" "$CMAKE" --build build/switch-app -j"$JOBS" --target $SWITCH_FIRST_TARGETS
+fi
 PATH="$DEVKITPRO/devkitA64/bin:$PATH" "$CMAKE" --build build/switch-app -j"$JOBS" --target UnleashedRecomp
 
 if [ "$SWITCH_DIRECT_CALLS" = "1" ]; then

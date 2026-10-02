@@ -183,10 +183,13 @@ Memory::Memory()
         return;
     }
 
+    // [Switch] Round 11: one more page, reserved and never committed, after the 4 GB window. With SWITCH_WIDE_DFORM
+    // (tools/switch-codegen-pass.py) a register + displacement access whose 32-bit sum would wrap past 4 GB lands in
+    // it instead of in guest page 0, and faults the same way (ppc_context.h, PPC_LOAD_U32_D).
     virtmemLock();
-    base = static_cast<uint8_t*>(virtmemFindAslr(PPC_MEMORY_SIZE, SWITCH_PAGE_SIZE));
+    base = static_cast<uint8_t*>(virtmemFindAslr(PPC_MEMORY_SIZE + SWITCH_PAGE_SIZE, SWITCH_PAGE_SIZE));
     if (base != nullptr)
-        reservation = virtmemAddReservation(base, PPC_MEMORY_SIZE);
+        reservation = virtmemAddReservation(base, PPC_MEMORY_SIZE + SWITCH_PAGE_SIZE);
     virtmemUnlock();
 
     if (base == nullptr)
@@ -263,6 +266,10 @@ bool Memory::CommitRange(size_t offset, size_t size) noexcept
         return base != nullptr;
 
     if (offset >= PPC_MEMORY_SIZE || size > PPC_MEMORY_SIZE - offset)
+        return false;
+
+    // Guest page 0 is never mapped: null pointers fault, and so do accesses that wrap past 4 GB (see the guard page).
+    if (offset < SWITCH_PAGE_SIZE)
         return false;
 
     const size_t begin = AlignDown(offset, SWITCH_PAGE_SIZE);

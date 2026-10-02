@@ -150,6 +150,19 @@ struct GuestBaseTexture : GuestResource
     }
 };
 
+#if defined(__SWITCH__)
+// [Switch] Round 13, SwitchPerResourceLockWait: an object's count of unlocks the render thread has not copied yet. A
+// texture or buffer made by copy or move (from a temporary) starts with none: it has sent no unlock of its own.
+struct PendingUnlockCount
+{
+    std::atomic<uint32_t> value{ 0 };
+
+    PendingUnlockCount() = default;
+    PendingUnlockCount(const PendingUnlockCount&) noexcept {}
+    PendingUnlockCount& operator=(const PendingUnlockCount&) noexcept { return *this; }
+};
+#endif
+
 // Texture/VolumeTexture
 struct GuestTexture : GuestBaseTexture
 {
@@ -170,6 +183,11 @@ struct GuestTexture : GuestBaseTexture
     bool hadSurfaceImage = false;
     // [Switch] SwitchKeepResolvesPending: the pending copy from sourceSurface was kept over a Present.
     bool pendingCarried = false;
+    // [Switch] Round 13, SwitchPerResourceLockWait: unlocks sent to the render thread that it has not copied from
+    // mappedMemory yet (a lock waits for these instead of for the previous Present's tail), and the Present count
+    // when the last one was sent (D3D thread only).
+    PendingUnlockCount pendingUnlocks;
+    uint32_t unlockSerial = 0;
 #endif
 };
 
@@ -199,6 +217,9 @@ struct GuestBuffer : GuestResource
     uint32_t guestFormat = 0;
     bool lockedReadOnly = false;
 #if defined(__SWITCH__)
+    // [Switch] Round 13, SwitchPerResourceLockWait: unlocks sent to the render thread not copied yet (see GuestTexture).
+    PendingUnlockCount pendingUnlocks;
+    uint32_t unlockSerial = 0;
     // [Switch] SwitchStreamingBuffers, render thread only: the contents of this frame's last unlock
     // from the game's D3D thread, in the frame's upload ring. Draws bind that copy; the end of the
     // frame copies it into `buffer`. Valid while streamingFrame is the current streaming frame.

@@ -857,8 +857,15 @@ void Config::Save()
 
     for (auto def : g_configDefinitions)
     {
+#if defined(__SWITCH__)
+        // [Switch] The [Switch] options are hidden from the menus but always written, with their defaults the first
+        // time, so config.toml lists every one of them (they are the last section; see config_def.h).
+        if (def->IsHidden() && def->GetSection() != "Switch")
+            continue;
+#else
         if (def->IsHidden())
             continue;
+#endif
 
         auto isFirstSection = section.empty();
         auto isDefWithSection = section != def->GetSection();

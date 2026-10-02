@@ -1153,3 +1153,16 @@ registers = ["f1"]
 name = "CEvilSonicContext_CStateWall_LeaveRotationMidAsmHook"
 address = 0x82406774
 registers = ["f1"]
+
+# [Switch] Round 15, SwitchSceneGraphPrefetch (UnleashedRecomp/patches/native_r15.cpp): the scene-graph update walk
+# prefetches the next child while the current one is processed. Prefetches only; the next element is read only when
+# the loop itself reads it on its next pass.
+[[midasm_hook]]
+name = "SceneGraphNodePrefetchMidAsmHook"
+address = 0x82E1B950
+registers = ["r30", "r28"]
+
+[[midasm_hook]]
+name = "SceneGraphObjectPrefetchMidAsmHook"
+address = 0x82E1AB70
+registers = ["r27", "r28", "r29"]

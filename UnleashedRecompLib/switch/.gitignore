@@ -1,0 +1,2 @@
+# Made by tools/switch-localize.py during every build (step 4 of tools/build-switch.sh).
+localized_*.inl

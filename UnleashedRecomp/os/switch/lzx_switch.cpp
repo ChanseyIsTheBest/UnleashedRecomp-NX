@@ -31,6 +31,9 @@ namespace
 
     constexpr PositionSlots SLOTS;
 
+    // [Switch] SwitchFastNativeDecompress: DecodeCompressedFast instead of DecodeCompressed.
+    bool g_fastDecoder = false;
+
     constexpr uint32_t MAIN_MAX_SYMBOLS = 256 + 52 * 8;
     constexpr uint32_t LENGTH_SYMBOLS = 249;
     constexpr uint32_t PRETREE_SYMBOLS = 20;
@@ -269,8 +272,179 @@ namespace
             }
         }
 
+        // SwitchFastNativeDecompress: the same decoding with the bit reader and the repeated offsets in locals. As
+        // members they stay in memory: every output byte stored through a uint8_t pointer might change them. Matches
+        // at least 8 back are copied 8 bytes at a time: each chunk reads only bytes before the one it writes, all
+        // final by then, so the result is the byte-by-byte copy's. The same checks, at the same points, throw.
+        struct FastBits
+        {
+            const uint8_t* source;
+            size_t sourceSize;
+            size_t cur;
+            size_t end;
+            uint32_t buffer;
+            int32_t count;
+
+            __attribute__((always_inline)) void Fill(uint32_t bits)
+            {
+                buffer <<= bits;
+                count -= int32_t(bits);
+                for (int i = 0; i < 2; i++)
+                {
+                    if (count > 0)
+                        return;
+                    if (cur >= end)
+                        return;
+                    if (cur + 1 >= sourceSize)
+                        throw DecodeError();
+
+                    const uint32_t word = uint32_t(source[cur]) | (uint32_t(source[cur + 1]) << 8);
+                    cur += 2;
+                    if (count > -32)
+                        buffer |= word << uint32_t(-count);
+                    count += 16;
+                }
+            }
+
+            __attribute__((always_inline)) uint32_t GetBits(uint32_t bits)
+            {
+                const uint32_t value = buffer >> (32 - bits);
+                Fill(bits);
+                return value;
+            }
+
+            template<uint32_t TABLE_BITS, uint32_t MAX_SYMBOLS>
+            __attribute__((always_inline)) uint32_t Decode(const Huffman<TABLE_BITS, MAX_SYMBOLS>& tree)
+            {
+                const uint32_t entry = tree.table[buffer >> (32 - TABLE_BITS)];
+                const uint32_t length = entry & 0xFF;
+                if (length != 0 && length != 0xFF)
+                {
+                    Fill(length);
+                    return entry >> 8;
+                }
+
+                if (length == 0)
+                    throw DecodeError();
+
+                const uint32_t peek = buffer >> 16;
+                for (uint32_t codeLength = TABLE_BITS + 1; codeLength <= tree.maxLength; codeLength++)
+                {
+                    const uint32_t code = peek >> (16 - codeLength);
+                    if (code - tree.firstCode[codeLength] < tree.count[codeLength])
+                    {
+                        Fill(codeLength);
+                        return tree.sorted[tree.offset[codeLength] + code - tree.firstCode[codeLength]];
+                    }
+                }
+
+                throw DecodeError();
+            }
+        };
+
+        void DecodeCompressedFast(uint32_t amount, bool aligned)
+        {
+            FastBits bits{ source, sourceSize, cur, end, bitBuffer, bitCount };
+            uint32_t repeated0 = repeated[0], repeated1 = repeated[1], repeated2 = repeated[2];
+            uint8_t* const out = output;
+            size_t pos = position;
+            const size_t stop = pos + amount;
+            while (pos < stop)
+            {
+                if (bits.cur >= bits.end)
+                    throw DecodeError();
+
+                uint32_t symbol = bits.Decode(mainTree);
+                if (symbol < 256)
+                {
+                    out[pos++] = uint8_t(symbol);
+                    continue;
+                }
+
+                symbol -= 256;
+                uint32_t length = symbol & 7;
+                if (length == 7)
+                    length += bits.Decode(lengthTree);
+                length += 2;
+
+                const uint32_t slot = symbol >> 3;
+                uint32_t matchOffset;
+                if (slot > 2)
+                {
+                    const uint32_t extra = SLOTS.extraBits[slot];
+                    if (aligned && extra >= 3)
+                    {
+                        uint32_t value = extra > 3 ? bits.GetBits(extra - 3) << 3 : 0;
+                        value += bits.Decode(alignedTree);
+                        matchOffset = SLOTS.offsetBase[slot] + value;
+                    }
+                    else if (extra != 0)
+                    {
+                        matchOffset = SLOTS.offsetBase[slot] + bits.GetBits(extra);
+                    }
+                    else
+                    {
+                        matchOffset = SLOTS.offsetBase[slot];
+                    }
+
+                    repeated2 = repeated1;
+                    repeated1 = repeated0;
+                    repeated0 = matchOffset;
+                }
+                else if (slot == 0)
+                {
+                    matchOffset = repeated0;
+                }
+                else if (slot == 1)
+                {
+                    matchOffset = repeated1;
+                    repeated1 = repeated0;
+                    repeated0 = matchOffset;
+                }
+                else
+                {
+                    matchOffset = repeated2;
+                    repeated2 = repeated0;
+                    repeated0 = matchOffset;
+                }
+
+                if (matchOffset == 0 || matchOffset > pos || matchOffset >= windowSize || pos + length > stop)
+                    throw DecodeError();
+
+                const uint8_t* from = out + pos - matchOffset;
+                uint8_t* to = out + pos;
+                uint32_t k = 0;
+                if (matchOffset >= 8)
+                {
+                    for (; k + 8 <= length; k += 8)
+                    {
+                        uint64_t chunk;
+                        memcpy(&chunk, from + k, sizeof(chunk));
+                        memcpy(to + k, &chunk, sizeof(chunk));
+                    }
+                }
+                for (; k < length; k++)
+                    to[k] = from[k];
+                pos += length;
+            }
+
+            position = pos;
+            cur = bits.cur;
+            bitBuffer = bits.buffer;
+            bitCount = bits.count;
+            repeated[0] = repeated0;
+            repeated[1] = repeated1;
+            repeated[2] = repeated2;
+        }
+
         void DecodeCompressed(uint32_t amount, bool aligned)
         {
+            if (g_fastDecoder)
+            {
+                DecodeCompressedFast(amount, aligned);
+                return;
+            }
+
             size_t pos = position;
             const size_t stop = pos + amount;
             while (pos < stop)
@@ -446,6 +620,11 @@ namespace
     {
         return (uint32_t(data[0]) << 8) | data[1];
     }
+}
+
+void os::switch_lzx::SetFastDecoder(bool fast)
+{
+    g_fastDecoder = fast;
 }
 
 bool os::switch_lzx::Decompress(const uint8_t* source, uint32_t sourceSize, uint32_t windowSize, uint8_t* destination,

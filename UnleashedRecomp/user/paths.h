@@ -21,6 +21,9 @@ inline std::filesystem::path GetGamePath()
     // /Applications/, and the bundle should not be modified. Thus we need
     // to install game files to the user directory instead of next to the app.
     return GetUserPath();
+#elif defined(__SWITCH__)
+    // [Switch] The NRO's folder, wherever it is on the SD card (os/switch/process_switch.cpp).
+    return g_executableRoot;
 #else
     return GAME_INSTALL_DIRECTORY;
 #endif

@@ -40,8 +40,8 @@ What changed on this side for the current mesa-switch:
 - `os/switch/nvk_switch_stubs.c` gained weak libelf stubs (the driver's CUBIN parser references libelf, which
   devkitPro does not ship and which never runs on Horizon), and its existing stubs are now weak, so a driver that
   brings its own definition of one of them no longer fails the link.
-- stderr goes to `sdmc:/switch/UnleashedRecomp/stderr.log`: the renderer's and the driver's diagnostics were lost
-  before, since Horizon has no console behind stderr.
+- With `[Switch] SwitchLog = true`, stderr goes to `stderr.log` next to the NRO: the renderer's and the driver's
+  diagnostics were lost before, since Horizon has no console behind stderr.
 - `[Switch] SwitchMesaEnvironment = "NAME=value;NAME=value"` sets driver variables before the instance is
   created, to A/B the driver's changes without rebuilding (`NVK_SWITCH_DIBUJO=0`, `NVK_SWITCH_DYN_UBO_DELTA=0`,
   `NVK_COPY_ENGINE=1`, `NVK_SUBTILING_KNOB=0x20164010`...).
@@ -65,15 +65,20 @@ In `stderr.log`:
 Then compare frame times with the old driver in the same places, and with `SwitchMesaEnvironment` switching the
 driver's paths off one at a time.
 
-## Maxwell operand reuse in the shader compiler (on by default)
+## Maxwell operand reuse in the shader compiler (opt-in again since NAK revision 5)
 
 NAK sets Maxwell's operand-reuse control bits between neighbouring FADD/FMUL/FFMA instructions that
 read the same register in the same operand slot, so the second takes it from the reuse cache instead
 of the register file, avoiding register-bank conflicts. Same results, fewer stalls in math-heavy
 shaders: on the console the GPU frame at the hub went from 22.63 to 22.49 ms, and nothing rendered
-differently. It started as the opt-in `NAK_DEBUG=reuse` and is now the default; `NAK_DEBUG=noreuse`
-turns it off (the old `reuse` flag is accepted and does nothing). The driver's NAK revision in the
-shader cache key went to 2, so the first launch with this driver recompiles every shader.
+differently. It started as the opt-in `NAK_DEBUG=reuse`, was the default from NAK revision 2 to 4, and is
+opt-in again since revision 5 (round 13): when the dark character eyes were found it was the one change whose
+correctness rests on undocumented hardware behaviour. The eyes stayed dark without it (round 13 config 1, and
+eyes-a with it back on), so it was not their cause: round 16 found that in the game's shader translator. `NAK_DEBUG=reuse` turns it on (`reusebasic`: FADD/FMUL/FFMA
+only), `noreuse` wins over both. Revision 5 alone keeps binaries compiled with reuse out of the caches (the
+default flags value is the same as under revision 4), so the first launch recompiles every shader. Since round 14
+Unleashed can ask for it itself (`[Switch] SwitchOperandReuse = true` sets `NAK_DEBUG=reuse` before the instance is
+created); the driver's default stays off for the other games built with it.
 
 ## ZCULL direction experiments
 
@@ -153,7 +158,23 @@ draw-path paths. To keep this driver as close as possible to what other games ex
   `SwitchNvkFastPaths = true`. These work on the CPU side (the render thread's time inside the driver), which a
   GPU-bound test cannot show; the round 6 test set measures them at 480p.
 
-What stays of ours: Maxwell operand reuse (FADD/FMUL/FFMA, and FMNMX/FSET/FSETP/SEL), the ZCULL direction modes
+What stays of ours: Maxwell operand reuse (FADD/FMUL/FFMA, and FMNMX/FSET/FSETP/SEL; opt-in since revision 5), the
+ZCULL direction modes
 (`NVK_ZCULL`; the game uses `greater`), unread varyings dropped when a pipeline is linked (`NVK_LINK_VARYINGS`) and
 for pipelines without a fragment shader (`NVK_SWITCH_VS_ONLY_VARYINGS`), and the scheduler latency knobs (default
 200, nfsmw-nx's value). No change to the compiled shaders, so the shader cache stays valid.
+
+## Round 14: the eye test with Mesa 26.2.3
+
+The dark character eyes (see "Current state" in SWITCH-PERFORMANCE.md) survived every switch of ours that the eye
+configurations of round 13 turned off. Round 14 therefore also ships the same game build linked against Mesa 26.2.3
+from danfromtico/mesa-switch, built by the user without this fork's patches (`NVK_ROOT` set to that SDK's
+`portlibs/switch` folder). The game's references to the fork are weak symbols (`nvk_switch_set4`,
+`nvk_switch_dibujo`, `_mesa_blake3_compute`) and its driver settings are environment variables, so it links and runs
+without them; the fork's ZCULL modes, varying linking, shader statistics and scheduler knobs are simply absent. If
+the eyes are right with it, the difference lies between 26.2.2 with this fork's patches and 26.2.3, and the patches
+are ported to 26.2.3 next.
+
+Result: dark with 26.2.3 too. Round 16 then instrumented this driver (NIR and NAK dumps, replacement shaders) and
+found it compiled the eye shaders correctly. The cause was the game's shader translator (see Round 16 in
+SWITCH-PERFORMANCE.md). That instrumentation is not in the driver any more.

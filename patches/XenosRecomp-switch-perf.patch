@@ -34,27 +34,30 @@ index d49bd32..de11a72 100644
 +    IDxcBlob* compile(const std::string& shaderSource, bool compilePixelShader, bool compileLibrary, bool compileSpirv, bool vulkan11 = false);
  };
 diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
-index d015145..4daa5a4 100644
+index d015145..b9d77b6 100644
 --- a/XenosRecomp/main.cpp
 +++ b/XenosRecomp/main.cpp
-@@ -1,5 +1,6 @@
+@@ -1,6 +1,8 @@
  #include "shader.h"
  #include "shader_recompiler.h"
 +#include "shader_common.h"
  #include "dxc_compiler.h"
++#include <set>
  
  static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
-@@ -27,6 +28,9 @@ struct RecompiledShader
+ {
+@@ -27,6 +29,10 @@ struct RecompiledShader
      IDxcBlob* dxil = nullptr;
      std::vector<uint8_t> spirv;
      uint32_t specConstantsMask = 0;
 +    uint32_t float4ConstantRegisters = 0;
 +    uint32_t gatherSlots = 0;
 +    uint32_t flags = 0;
++    uint32_t textureSlotsRead = 0xFFFFFFFF;
  };
  
  int main(int argc, char** argv)
-@@ -115,6 +119,12 @@ int main(int argc, char** argv)
+@@ -115,15 +121,64 @@ int main(int argc, char** argv)
  
          std::atomic<uint32_t> progress = 0;
  
@@ -64,10 +67,30 @@ index d015145..4daa5a4 100644
 +        if (dumpDir != nullptr)
 +            std::filesystem::create_directories(dumpDir);
 +
++        // XENOS_RECOMP_ONLY=<hash>,<hash>...: with XENOS_RECOMP_DUMP_DIR, translate only these shaders (hexadecimal
++        // hashes as dumped) and write no cache, to study a few of them quickly.
++        std::set<XXH64_hash_t> only;
++        if (const char* list = getenv("XENOS_RECOMP_ONLY"); list != nullptr && dumpDir != nullptr)
++        {
++            const std::string text(list);
++            for (size_t start = 0; start < text.size();)
++            {
++                size_t comma = text.find(',', start);
++                if (comma == std::string::npos)
++                    comma = text.size();
++                only.insert(std::stoull(text.substr(start, comma - start), nullptr, 16));
++                start = comma + 1;
++            }
++        }
++
          std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
              {
                  auto& shader = hashShaderPair.second;
-@@ -124,6 +134,30 @@ int main(int argc, char** argv)
++                if (!only.empty() && only.count(hashShaderPair.first) == 0)
++                    return;
+ 
+                 thread_local ShaderRecompiler recompiler;
+                 recompiler = {};
                  recompiler.recompile(shader.data, include);
  
                  shader.specConstantsMask = recompiler.specConstantsMask;
@@ -75,6 +98,7 @@ index d015145..4daa5a4 100644
 +                shader.float4ConstantRegisters = recompiler.float4RelativeAccess ? (recompiler.isPixelShader ? 224 : 256) :
 +                    recompiler.float4ConstantRegisters;
 +                shader.gatherSlots = recompiler.gatherSlots;
++                shader.textureSlotsRead = recompiler.textureSlotsRead;
 +                shader.flags = (recompiler.positionPassThrough ? SHADER_FLAG_POSITION_PASS_THROUGH : 0) |
 +                    (recompiler.hasKill ? SHADER_FLAG_PIXEL_KILL : 0) |
 +                    (recompiler.texcoordPassThrough ? SHADER_FLAG_TEXCOORD_PASS_THROUGH : 0) |
@@ -98,7 +122,7 @@ index d015145..4daa5a4 100644
  
                  thread_local DxcCompiler dxcCompiler;
  
-@@ -133,12 +167,23 @@ int main(int argc, char** argv)
+@@ -133,12 +188,23 @@ int main(int argc, char** argv)
                  assert(*(reinterpret_cast<uint32_t *>(shader.dxil->GetBufferPointer()) + 1) != 0 && "DXIL was not signed properly!");
  #endif
  
@@ -123,15 +147,25 @@ index d015145..4daa5a4 100644
                  spirv->Release();
  
                  size_t currentProgress = ++progress;
-@@ -157,8 +202,9 @@ int main(int argc, char** argv)
+@@ -146,6 +212,9 @@ int main(int argc, char** argv)
+                     fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
+             });
+ 
++        if (!only.empty())
++            return 0;
++
+         fmt::println("Creating shader cache...");
+ 
+         StringBuffer f;
+@@ -157,8 +226,9 @@ int main(int argc, char** argv)
  
          for (auto& [hash, shader] : shaders)
          {
 -            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {} }},",
 -                hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask);
-+            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, {} }},",
++            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, {}, {} }},",
 +                hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask,
-+                shader.float4ConstantRegisters, shader.gatherSlots, shader.flags);
++                shader.float4ConstantRegisters, shader.gatherSlots, shader.flags, shader.textureSlotsRead);
  
              if (shader.dxil != nullptr)
              {
@@ -392,7 +426,7 @@ index 1c74034..9c54f89 100644
  
  float computeMipLevel(float2 pixelCoord)
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..854b798 100644
+index 698a418..fc4f1e7 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -1,6 +1,12 @@
@@ -842,7 +876,7 @@ index 698a418..854b798 100644
              break;
          }
  
-@@ -1173,12 +1365,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1173,14 +1365,25 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          {
              for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
              {
@@ -865,8 +899,14 @@ index 698a418..854b798 100644
 +            }
  
              samplers.emplace(constantInfo->registerIndex, constantName);
++        #ifdef UNLEASHED_RECOMP
++            for (uint32_t slot = constantInfo->registerIndex; slot < uint32_t(constantInfo->registerIndex + std::max<uint16_t>(constantInfo->registerCount, 1)); slot++)
++                textureSlotsRead |= slot < 32 ? (1u << slot) : 0u;
++        #endif
              break;
-@@ -1212,6 +1411,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+ 
+@@ -1212,6 +1415,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
                  println("#define {0}(INDEX) select((INDEX) < {1}, {0}[min(INDEX, {2})], 0.0)", constantName, tailCount, tailCount - 1);
@@ -875,7 +915,7 @@ index 698a418..854b798 100644
              }
          }
      }
-@@ -1238,6 +1439,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1238,6 +1443,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
              println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
                  constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
@@ -886,7 +926,7 @@ index 698a418..854b798 100644
          }
      }
  
-@@ -1368,6 +1573,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1368,6 +1577,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          out += "\t[unroll] for (int iterationIndex = 0; iterationIndex < 2; iterationIndex++)\n";
          out += "\t{\n";
@@ -899,7 +939,7 @@ index 698a418..854b798 100644
      }
  #endif
  
-@@ -1489,6 +1700,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1489,6 +1704,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\tfloat2 pixelCoord = 0.0;\n";
  #endif
          out += "\tCubeMapData cubeMapData = (CubeMapData)0;\n";
@@ -907,7 +947,7 @@ index 698a418..854b798 100644
      }
  
      const be<uint32_t>* code = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader->physicalOffset);
-@@ -1509,6 +1721,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1509,6 +1725,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      uint32_t instrAddress = 0;
      uint32_t instrSize = shader->size;
      bool simpleControlFlow = true;
@@ -917,7 +957,7 @@ index 698a418..854b798 100644
  
      while (instrAddress < instrSize)
      {
-@@ -1519,6 +1734,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1519,6 +1738,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          for (auto& cfInstr : controlFlow)
          {
@@ -927,7 +967,7 @@ index 698a418..854b798 100644
              uint32_t address = 0;
  
              switch (cfInstr.opcode)
-@@ -1559,6 +1777,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1559,6 +1781,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          instrAddress += 12;
      }
  
@@ -947,7 +987,7 @@ index 698a418..854b798 100644
      if (simpleControlFlow)
      {
          out += '\n';
-@@ -1642,6 +1873,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1642,6 +1877,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  break;
  
              case ControlFlowOpcode::LoopStart:
@@ -967,7 +1007,7 @@ index 698a418..854b798 100644
                  if (simpleControlFlow)
                  {
                      indent();
-@@ -1660,6 +1904,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1660,6 +1908,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  break;
  
              case ControlFlowOpcode::LoopEnd:
@@ -985,7 +1025,7 @@ index 698a418..854b798 100644
                  if (simpleControlFlow)
                  {
                      --indentation;
-@@ -1681,9 +1936,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1681,9 +1940,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  if (cfInstr.condJmp.isUnconditional)
                  {
@@ -1015,7 +1055,7 @@ index 698a418..854b798 100644
                  }
                  else
                  {
-@@ -1695,6 +1967,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1695,6 +1971,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      else
                      {
                          auto findResult = boolConstants.find(cfInstr.condJmp.boolAddress);
@@ -1033,7 +1073,7 @@ index 698a418..854b798 100644
                          if (findResult != boolConstants.end())
                              println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
                          else
-@@ -1753,6 +2036,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1753,6 +2040,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                          {
                              specConstantsMask |= SPEC_CONSTANT_BICUBIC_GI_FILTER;
  
@@ -1043,7 +1083,7 @@ index 698a418..854b798 100644
                              indent();
                              out += "if (g_SpecConstants() & SPEC_CONSTANT_BICUBIC_GI_FILTER)";
                              indent();
-@@ -1760,6 +2046,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1760,6 +2050,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
                              ++indentation;
                              recompile(textureFetch, true);
@@ -1051,7 +1091,7 @@ index 698a418..854b798 100644
                              --indentation;
  
                              indent();
-@@ -1771,6 +2058,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1771,6 +2062,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
                              ++indentation;
                              recompile(textureFetch, false);
@@ -1059,7 +1099,7 @@ index 698a418..854b798 100644
                              --indentation;
  
                              indent();
-@@ -1792,12 +2080,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1792,12 +2084,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  instructionCode += 3;
              }
  
@@ -1078,7 +1118,7 @@ index 698a418..854b798 100644
                      indent();
                      out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)";
                      indent();
-@@ -1825,6 +2119,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1825,6 +2123,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      indent();
                      out += '}';
                  #endif
@@ -1093,7 +1133,7 @@ index 698a418..854b798 100644
                  }
                  else
                  {
-@@ -1834,6 +2136,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1834,6 +2140,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      {
                          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                      }
@@ -1109,7 +1149,7 @@ index 698a418..854b798 100644
                  }
  
                  if (simpleControlFlow)
-@@ -1884,5 +2195,2413 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1884,5 +2199,2458 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
  #endif
  
@@ -1214,7 +1254,7 @@ index 698a418..854b798 100644
 +    else
 +        tap.component = offsetX < 0 ? 'x' : 'y';
 +    return true;
-+}
+ }
 +
 +static bool shadowTapFor3x3(int32_t offsetX, int32_t offsetY, ShadowTap& tap)
 +{
@@ -1233,7 +1273,7 @@ index 698a418..854b798 100644
 +
 +    tap = TAPS[offsetY / 2 + 1][offsetX / 2 + 1];
 +    return true;
- }
++}
 +
 +// The shadow maps' manual PCF: consecutive lines "rN.m = tfetch2D(S..., rC.ab, float2(x, y), S...).x;"
 +// of one sampler and one coordinate, with the 2x2 offsets (+-0.5, +-0.5) or the 3x3 offsets
@@ -2813,6 +2853,7 @@ index 698a418..854b798 100644
 +    // The statements before the branch, each with its braces and preprocessor lines.
 +    std::vector<SinkUnit> units;
 +    std::vector<std::vector<std::string>> constructs;
++    std::vector<size_t> constructElse; // the line of each construct's "else"
 +    for (size_t i = 0; i < body.size();)
 +    {
 +        if (trimmedLine(body[i]).empty())
@@ -2889,6 +2930,7 @@ index 698a418..854b798 100644
 +                gathers.lines.push_back("#endif");
 +
 +                constructs.push_back(unitLines);
++                constructElse.push_back(elseLine);
 +                units.push_back(std::move(fallback));
 +                units.push_back(std::move(gathers));
 +                continue;
@@ -2940,6 +2982,7 @@ index 698a418..854b798 100644
 +    SinkRenamer renamer;
 +    std::vector<SinkUnit> renamed;
 +    renamed.reserve(units.size() * 2);
++    std::vector<bool> constructRenamed(constructs.size(), false); // its halves read and write temporaries now
 +
 +    auto pushCopies = [&](const ComponentSets& which)
 +        {
@@ -2980,6 +3023,7 @@ index 698a418..854b798 100644
 +        const size_t count = (unit.construct != SIZE_MAX && i + 1 < units.size() && units[i + 1].construct == unit.construct) ? 2 : 1;
 +        if (count == 2 && renamer.RewriteConstruct(units[i].lines, units[i + 1].lines))
 +        {
++            constructRenamed[unit.construct] = true;
 +            renamed.push_back(std::move(units[i]));
 +            renamed.push_back(std::move(units[i + 1]));
 +            i++;
@@ -3116,6 +3160,17 @@ index 698a418..854b798 100644
 +                    reason = "?";
 +            }
 +            sinkDebug += fmt::format("#{} {}: {}\n", i, reason, first);
++            if (getenv("XENOS_SINK_DEBUG_SETS") != nullptr)
++            {
++                auto sets = [](const ComponentSets& s)
++                    {
++                        std::string text;
++                        for (const auto& [name, mask] : s)
++                            text += fmt::format(" {}:{:x}", name, mask);
++                        return text;
++                    };
++                sinkDebug += fmt::format("    uses{} | mayDefs{} | mustDefs{}\n", sets(renamed[i].uses), sets(renamed[i].mayDefs), sets(renamed[i].mustDefs));
++            }
 +        }
 +    }
 +    std::vector<bool> keptQuad = computeKept(true);
@@ -3209,7 +3264,37 @@ index 698a418..854b798 100644
 +            {
 +                if (!constructEmitted[unit.construct])
 +                {
-+                    result.insert(result.end(), constructs[unit.construct].begin(), constructs[unit.construct].end());
++                    if (constructRenamed[unit.construct])
++                    {
++                        // Round 16: the construct with its renamed halves (SinkRenamer::RewriteConstruct): their
++                        // reads of renamed values and their writes of temporaries are what the statements around
++                        // them were analysed and renamed with. The original lines read and wrote the registers, which
++                        // the renamed statements no longer use (the shadow filter of the SonicEye shaders fetched at
++                        // stale coordinates, and its results were never read).
++                        const SinkUnit* fallbackHalf = nullptr;
++                        const SinkUnit* gatherHalf = nullptr;
++                        for (const auto& other : renamed)
++                        {
++                            if (other.construct == unit.construct)
++                                (other.gatherPath ? gatherHalf : fallbackHalf) = &other;
++                        }
++
++                        const auto& original = constructs[unit.construct];
++                        const size_t elseLine = constructElse[unit.construct];
++                        assert(fallbackHalf != nullptr && gatherHalf != nullptr);
++                        assert(gatherHalf->lines.size() >= 2 && fallbackHalf->lines.size() >= 3);
++
++                        // #ifdef __spirv__ / [branch] if (C) { gathers } / else / #endif / { point fetches }
++                        result.push_back(original[0]);
++                        result.insert(result.end(), gatherHalf->lines.begin() + 1, gatherHalf->lines.end() - 1);
++                        result.push_back(original[elseLine]);
++                        result.push_back(original[elseLine + 1]);
++                        result.insert(result.end(), fallbackHalf->lines.begin() + 3, fallbackHalf->lines.end());
++                    }
++                    else
++                    {
++                        result.insert(result.end(), constructs[unit.construct].begin(), constructs[unit.construct].end());
++                    }
 +                    constructEmitted[unit.construct] = true;
 +                }
 +                continue;
@@ -3524,10 +3609,10 @@ index 698a418..854b798 100644
 +}
 +#endif
 diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
-index b2e317d..59872b9 100644
+index b2e317d..6844cd8 100644
 --- a/XenosRecomp/shader_recompiler.h
 +++ b/XenosRecomp/shader_recompiler.h
-@@ -34,11 +34,72 @@ struct ShaderRecompiler : StringBuffer
+@@ -34,11 +34,78 @@ struct ShaderRecompiler : StringBuffer
      std::unordered_map<uint32_t, uint32_t> ifEndLabels;
      uint32_t specConstantsMask = 0;
  
@@ -3575,6 +3660,12 @@ index b2e317d..59872b9 100644
 +
 +    // Pixel shaders: the texture slots read by gathers of rewriteShadowFetches() (bit s = slot s).
 +    uint32_t gatherSlots = 0;
++
++    // [Switch] Round 15: the texture slots the shader can fetch from (bit s = slot s): its declared samplers. Every
++    // fetch the translator emits names a declared sampler (an undeclared one would not compile), so this holds every
++    // slot the shader reads, and perhaps a declared one it does not. The renderer uses it to tell a texture that is
++    // only bound from one that is read.
++    uint32_t textureSlotsRead = 0;
 +
 +    // Pixel shaders: SPEC_CONSTANT_ALPHA_TEST_SINK and _QUAD_SINK, run after rewriteAlphaTestEarlyOut.
 +    // Returns the number of statements moved out of the discarded pixels' way.

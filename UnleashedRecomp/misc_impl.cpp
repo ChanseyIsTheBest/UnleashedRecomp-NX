@@ -4,6 +4,7 @@
 #if defined(__SWITCH__)
 #include <os/switch_cpu_profiler.h>
 #include <os/switch_lzx.h>
+#include <patches/message_dispatch.h>
 #endif
 
 uint32_t QueryPerformanceCounterImpl(LARGE_INTEGER* lpPerformanceCount)
@@ -83,22 +84,15 @@ bool g_nativeShaderConstants = false;
 // address, 4-byte aligned, carries the result in bit 0), so a reader sees a whole entry or none.
 static std::atomic<uint64_t> g_typeInfoComparisons[1024];
 
-PPC_FUNC_IMPL(__imp__sub_831B0AB8);
-PPC_FUNC(sub_831B0AB8)
+static uint32_t TypeInfoEqual(uint8_t* base, uint32_t a, uint32_t b)
 {
-    if (!g_nativeRtti)
-    {
-        __imp__sub_831B0AB8(ctx, base);
-        return;
-    }
-
-    const uint32_t a = ctx.r3.u32;
-    const uint32_t b = ctx.r4.u32;
     if (a == b)
-    {
-        ctx.r3.u64 = 1;
-        return;
-    }
+        return 1;
+
+    // [Switch] SwitchExactTypeInfoSet (patches/message_dispatch.cpp): two different type descriptors of the image
+    // have different names (checked at startup), so they are never equal.
+    if (g_exactTypeInfoSet && IsImageTypeDescriptor(a) && IsImageTypeDescriptor(b))
+        return 0;
 
     auto inImage = [](uint32_t address)
         {
@@ -112,10 +106,7 @@ PPC_FUNC(sub_831B0AB8)
     {
         const uint64_t entry = slot.load(std::memory_order_relaxed);
         if ((entry & ~uint64_t(1)) == key)
-        {
-            ctx.r3.u64 = entry & 1;
-            return;
-        }
+            return uint32_t(entry & 1);
     }
 
     const char* first = reinterpret_cast<const char*>(base + uint32_t(a + 9));
@@ -123,7 +114,25 @@ PPC_FUNC(sub_831B0AB8)
     const uint32_t equal = strcmp(first, second) == 0 ? 1 : 0;
     if (cacheable)
         slot.store(key | equal, std::memory_order_relaxed);
+    return equal;
+}
+
+PPC_FUNC_IMPL(__imp__sub_831B0AB8);
+PPC_FUNC(sub_831B0AB8)
+{
+    if (!g_nativeRtti)
+    {
+        __imp__sub_831B0AB8(ctx, base);
+        return;
+    }
+
+    const uint32_t a = ctx.r3.u32;
+    const uint32_t equal = TypeInfoEqual(base, a, ctx.r4.u32);
     ctx.r3.u64 = equal;
+
+    // SwitchVerifyMessageDispatch: the dispatcher being verified learns which type matched first.
+    if (g_verifyMessageDispatch)
+        NoteTypeInfoComparison(a, equal != 0);
 }
 
 // __RTtypeid (MSVC CRT): the type descriptor of the complete object r3 points to, from its vftable's complete

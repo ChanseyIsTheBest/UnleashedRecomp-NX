@@ -86,14 +86,16 @@ if (UNLEASHED_RECOMP_SWITCH)
     set(UNLEASHED_RECOMP_HOST_X_DECOMPRESS "${UNLEASHED_RECOMP_HOST_TOOLS_DIR}/tools/x_decompress/x_decompress" CACHE FILEPATH "Host x_decompress executable.")
     set(UNLEASHED_RECOMP_HOST_XENON_RECOMP "${UNLEASHED_RECOMP_HOST_TOOLS_DIR}/tools/XenonRecomp/XenonRecomp/XenonRecomp" CACHE FILEPATH "Host XenonRecomp executable.")
     set(UNLEASHED_RECOMP_HOST_XENOS_RECOMP "${UNLEASHED_RECOMP_HOST_TOOLS_DIR}/tools/XenosRecomp/XenosRecomp/XenosRecomp" CACHE FILEPATH "Host XenosRecomp executable.")
-    set(UNLEASHED_RECOMP_XENON_RECOMP_COMMAND
-        "${UNLEASHED_RECOMP_HOST_XENON_RECOMP}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/config/SWA.toml"
-        "${UNLEASHED_RECOMP_TOOLS_ROOT}/XenonRecomp/XenonUtils/ppc_context.h"
-    )
     # tools/build-switch.sh generates ppc/ itself (step 4, and only when ppc/ is missing), then edits the
     # sources (tools/switch-direct-calls.py). The tool and ppc_context.h are rewritten by every patch
     # step, so depending on them made CMake regenerate all of ppc/ (and drop those edits) on every build.
+    # [Switch] Round 15: CMake never runs XenonRecomp itself. A newer SWA.toml, or a build folder with no
+    # record of the rule, made ninja run it again in step 6, without the code generation pass, direct
+    # calls or XenonRecomp's environment modes (explicit multiply-adds, fewer mode switches), over the
+    # sources step 4 had made; build-switch.sh regenerates ppc/ when the TOML changes instead.
+    set(UNLEASHED_RECOMP_XENON_RECOMP_COMMAND
+        "${CMAKE_COMMAND}" -E echo "UnleashedRecompLib/ppc comes from tools/build-switch.sh (step 4), not from CMake"
+    )
     set(UNLEASHED_RECOMP_XENON_RECOMP_DEPENDS "")
     set(UNLEASHED_RECOMP_PPC_CONTEXT_DEPENDS "")
     set(UNLEASHED_RECOMP_X_DECOMPRESS_COMMAND "${UNLEASHED_RECOMP_HOST_X_DECOMPRESS}")
